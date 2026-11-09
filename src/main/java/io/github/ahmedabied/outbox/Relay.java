@@ -63,6 +63,8 @@ public final class Relay {
     // A batch whose Kafka transaction committed and that the database has not marked yet, and when it committed.
     private List<OutboxRow> unmarked;
     private Instant committedAt;
+    // The last database error seen while not leading: each new one is logged once, not on every retry.
+    private String lastTrouble;
     private boolean suspectNext;
     private volatile boolean stopping;
 
@@ -112,6 +114,7 @@ public final class Relay {
                     return Step.STANDBY;
                 }
                 limit = settings.batchSize();
+                lastTrouble = null;
                 LOG.info("leading: this relay publishes now");
             }
             if (unmarked != null) {
@@ -138,12 +141,14 @@ public final class Relay {
         } catch (InterruptedException | RelayStoppedException e) {
             throw e;
         } catch (Exception e) { // the database: the connection, and the lead that lives on it, is gone
-            if (unmarked != null) {
-                LOG.log(Level.WARNING, "database trouble with " + unmarked.size() + " rows in Kafka but not marked sent;"
-                        + " they are marked before anything new is published, connecting again: " + e);
-            } else if (leading) {
-                LOG.log(Level.WARNING, "database trouble, giving up the lead and connecting again: " + e);
+            String trouble = String.valueOf(e);
+            if (leading || !trouble.equals(lastTrouble)) { // a missing table or a wrong URL is said once, not hidden
+                LOG.log(Level.WARNING, unmarked == null
+                        ? "database trouble, connecting again: " + trouble
+                        : "database trouble with " + unmarked.size() + " rows in Kafka but not marked sent; they are"
+                                + " marked before anything new is published, connecting again: " + trouble);
             }
+            lastTrouble = trouble;
             leading = false;
             store.reset();
             stats.databaseErrors.increment();

@@ -125,11 +125,12 @@ one window where a repeat can happen, so both the kept batch and the dedupe are 
 ## Tests
 
 ```bash
-mvn -B verify      # 43 tests: unit, then Postgres and Kafka integration tests in containers
+mvn -B verify      # 44 tests: unit, then Postgres and Kafka integration tests in containers
 ```
 
-- **Unit** (19, in-memory Postgres and Kafka stand-ins): order, retries, the bad-row search, a lost connection and a
-  dead process between Kafka and the database, a mark that keeps failing, leader handover, fencing, the reserved `outbox-id` header, the metrics endpoint over real HTTP,
+- **Unit** (20, in-memory Postgres and Kafka stand-ins): order, retries, the bad-row search, a lost connection and a
+  dead process between Kafka and the database, a mark that keeps failing, trouble before the lead logged once (a
+  missing table is said, not retried in silence), leader handover, fencing, the reserved `outbox-id` header, the metrics endpoint over real HTTP,
   table names (what is refused, and that the default keeps the old object names).
 - **Postgres** (17, `OUTBOX_TEST_DB_URL` or a container): the real queries, the advisory lock (one lead per table,
   however it is named, kept when the table is made again), `NOTIFY` wake-up, a

@@ -34,6 +34,7 @@ final class Fakes {
     static final class Store implements OutboxStore {
         final Db db;
         int failMarks;
+        int failLeads; // tryLead throws, as when the table is missing or the database is down
         int fetches;
 
         Store(Db db) {
@@ -41,7 +42,11 @@ final class Fakes {
         }
 
         @Override
-        public boolean tryLead() {
+        public boolean tryLead() throws SQLException {
+            if (failLeads > 0) {
+                failLeads--;
+                throw new SQLException("relation \"outbox\" does not exist");
+            }
             synchronized (db) {
                 if (db.leader == null || db.leader == this) {
                     db.leader = this;

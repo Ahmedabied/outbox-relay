@@ -9,6 +9,10 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.logging.Handler;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import java.util.LinkedHashSet;
 import java.util.List;
 
@@ -73,6 +77,38 @@ class RelayTest {
         var e = assertThrows(RelayStoppedException.class, () -> drain(relay));
         assertTrue(e.getMessage().startsWith("row 250 cannot be published"), e.getMessage());
         assertEquals(range(1, 249), ids(kafka.visible));
+    }
+
+    @Test
+    void troubleBeforeTheLeadIsLoggedOnceNotEveryRetry() throws Exception {
+        var db = new Fakes.Db().insert(10, 3);
+        var store = new Fakes.Store(db);
+        store.failLeads = 5; // say the table was never made: the relay must say so, not retry in silence
+        List<String> logged = Collections.synchronizedList(new ArrayList<>());
+        Handler h = new Handler() {
+            @Override
+            public void publish(LogRecord r) {
+                logged.add(r.getMessage());
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        Logger log = Logger.getLogger(Relay.class.getName());
+        log.addHandler(h);
+        try {
+            var kafka = new Fakes.Kafka();
+            drain(new Relay(store, kafka, fast(100)));
+            assertEquals(10, kafka.visible.size());
+        } finally {
+            log.removeHandler(h);
+        }
+        assertEquals(1, logged.stream().filter(m -> m.contains("does not exist")).count(), logged.toString());
     }
 
     @Test
