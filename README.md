@@ -67,12 +67,15 @@ Outbox ids are unique per outbox table, so a consumer that reads from two outbox
 [examples/python-consumer](examples/python-consumer) is a consumer in Python (confluent-kafka, psycopg 3) that does
 the same thing per batch: one Postgres transaction claims each `outbox-id` and applies only new ones, then the Kafka
 offsets are committed. `demo.py` runs it against a live relay through a crash between those two commits, next to a
-copy without the inbox, and checks the sums (Kafka 4.4 and Postgres 18 on this desktop; CI runs the same):
+copy without the inbox, and checks the sums. Kafka 4.4 and Postgres 18, the same result on a desktop and in CI:
 
-| 10,000 events | applied | counted twice | records/s |
-|---|---|---|---|
-| with the inbox | 10,000 | 0 (500 repeats skipped) | 14,456 |
-| without it | 10,500 | 500 | 24,300 |
+| 10,000 events | applied | counted twice | records/s, desktop | records/s, CI runner |
+|---|---|---|---|---|
+| with the inbox | 10,000 | 0 (500 repeats skipped) | 14,456 | 3,792 |
+| without it | 10,500 | 500 | 24,300 | 7,422 |
+
+The inbox costs one insert per record in the consumer's transaction: about 40 to 50% of a consumer that only adds
+up numbers, much less next to real work.
 
 ```bash
 pip install -r examples/python-consumer/requirements.txt
