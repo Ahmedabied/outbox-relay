@@ -81,6 +81,7 @@ up numbers, much less next to real work.
 ```bash
 pip install -r examples/python-consumer/requirements.txt
 python examples/python-consumer/demo.py --db postgresql://app@localhost/app --kafka localhost:9092   # relay running
+# with OUTBOX_TABLE set, pass the same name: --table app.orders_outbox
 ```
 
 ## Metrics

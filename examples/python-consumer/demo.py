@@ -20,6 +20,7 @@ import uuid
 from pathlib import Path
 
 import psycopg
+from psycopg import sql
 
 HERE = Path(__file__).resolve().parent
 
@@ -38,26 +39,28 @@ def main() -> int:
     p.add_argument("--db", required=True)
     p.add_argument("--kafka", required=True)
     p.add_argument("--events", type=int, default=10_000)
+    p.add_argument("--table", default="outbox", help="the table the relay serves (OUTBOX_TABLE): name or schema.name")
     args = p.parse_args()
+    table = sql.Identifier(*args.table.split("."))  # quoted, so the name is never read as SQL
     run = uuid.uuid4().hex[:8]
     topic = f"orders-demo-{run}"  # a fresh topic and consumer names, so the demo can run again on the same setup
 
     with psycopg.connect(args.db, autocommit=True) as db:
-        first, last = db.execute(
+        first, last = db.execute(sql.SQL(
             """with ins as (
-                 insert into outbox (topic, msg_key, payload)
+                 insert into {} (topic, msg_key, payload)
                  select %s, 'o-' || (g %% 100),
                         convert_to(json_build_object('order', 'o-' || (g %% 100), 'amount', (g %% 50) + 0.25)::text,
                                    'UTF8')
                    from generate_series(1, %s) g
                  returning id)
-               select min(id), max(id) from ins""", (topic, args.events)).fetchone()
+               select min(id), max(id) from ins""").format(table), (topic, args.events)).fetchone()
         want_amount = db.execute("select sum((g %% 50) + 0.25) from generate_series(1, %s) g",
                                  (args.events,)).fetchone()[0]
         print(f"{args.events:,} events written to the outbox (topic {topic}), waiting for the relay")
         t0 = time.monotonic()
-        while db.execute("select count(*) from outbox where id between %s and %s and sent_at is null",
-                         (first, last)).fetchone()[0]:
+        unsent = sql.SQL("select count(*) from {} where id between %s and %s and sent_at is null").format(table)
+        while db.execute(unsent, (first, last)).fetchone()[0]:
             if time.monotonic() - t0 > 120:
                 print("the relay did not send them within 120 s: is it running?")
                 return 1
