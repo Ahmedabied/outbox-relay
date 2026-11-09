@@ -48,7 +48,7 @@ class KafkaRelayIT {
         final KafkaPublisher publisher;
 
         Running(String txId, int batch) {
-            store = new PgOutboxStore(TestDb.url(), TestDb.props(), txId);
+            store = new PgOutboxStore(TestDb.url(), TestDb.props());
             publisher = new KafkaPublisher(KafkaEnv.bootstrap(), txId, Map.of());
             relay = new Relay(store, publisher, Relay.Settings.defaults().withBatchSize(batch));
             thread = new Thread(() -> {
@@ -192,7 +192,7 @@ class KafkaRelayIT {
         try (Connection c = TestDb.connect()) {
             KafkaEnv.insert(c, topic, n, 100);
         }
-        var real = new PgOutboxStore(TestDb.url(), TestDb.props(), "window-kept");
+        var real = new PgOutboxStore(TestDb.url(), TestDb.props());
         OutboxStore dying = dyingAtTheThirdMark(real);
         try (var publisher = new KafkaPublisher(KafkaEnv.bootstrap(), "window-kept", Map.of());
              KafkaEnv.Consumer consumer = new KafkaEnv.Consumer(topic)) {
@@ -220,7 +220,7 @@ class KafkaRelayIT {
         try (Connection c = TestDb.connect()) {
             KafkaEnv.insert(c, topic, n, 100);
         }
-        var real = new PgOutboxStore(TestDb.url(), TestDb.props(), "window");
+        var real = new PgOutboxStore(TestDb.url(), TestDb.props());
         OutboxStore dying = dyingAtTheThirdMark(real);
         try (var publisher = new KafkaPublisher(KafkaEnv.bootstrap(), "window", Map.of());
              KafkaEnv.Consumer consumer = new KafkaEnv.Consumer(topic)) {

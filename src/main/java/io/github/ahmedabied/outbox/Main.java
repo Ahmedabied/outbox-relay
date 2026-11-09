@@ -34,7 +34,8 @@ public final class Main {
               OUTBOX_DB_USER, OUTBOX_DB_PASSWORD
               KAFKA_BOOTSTRAP_SERVERS  host:9092                                (run)
               OUTBOX_TABLE             default outbox; another name, or schema.name (one relay per table)
-              OUTBOX_TRANSACTIONAL_ID  default outbox-relay (outbox-relay:<table> for another table)
+              OUTBOX_TRANSACTIONAL_ID  default outbox-relay (outbox-relay:<table> for another table); the same on
+                                       every replica of a table, so Kafka fences a relay that lost the lead
               OUTBOX_BATCH_SIZE        default 500
               OUTBOX_STATS_SECONDS     print counters and lag this often, default 30 (0: never)
               OUTBOX_METRICS_ADDR      serve Prometheus metrics at /metrics: PORT (127.0.0.1) or HOST:PORT; off if unset
@@ -72,7 +73,7 @@ public final class Main {
                 .withBatchSize(Integer.parseInt(env("OUTBOX_BATCH_SIZE", "500")));
         long statsEvery = Long.parseLong(env("OUTBOX_STATS_SECONDS", "30"));
 
-        PgOutboxStore store = new PgOutboxStore(url, db, txId, table);
+        PgOutboxStore store = new PgOutboxStore(url, db, table);
         KafkaPublisher publisher = new KafkaPublisher(need("KAFKA_BOOTSTRAP_SERVERS"), txId, Map.of());
         Relay relay = new Relay(store, publisher, settings);
         String metricsAddr = env("OUTBOX_METRICS_ADDR", "");

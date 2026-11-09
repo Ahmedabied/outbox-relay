@@ -40,7 +40,7 @@ names of earlier versions, so an existing install carries on as it is.
 |---|---|
 | Nothing lost | A row is marked sent only after Kafka has committed it. No high-water mark: a row that commits late with a lower id is still picked up (tested). |
 | Order per key | Rows go out in id order, and each batch is **one Kafka transaction** with an idempotent producer (`acks=all`). A failed batch is aborted, so `read_committed` consumers never see half of it and a retry cannot reorder. |
-| One relay at a time | The relay holds a Postgres session advisory lock on its own connection. If that connection dies, the lock goes with it and a standby takes over. The Kafka `transactional.id` is a second fence: a relay that still thinks it leads is refused by Kafka. |
+| One relay at a time | The relay holds a Postgres session advisory lock on its own connection, keyed on the table itself (schema and name), so replicas take turns whatever else differs between them. If that connection dies, the lock goes with it and a standby takes over. The Kafka `transactional.id` is a second fence, when replicas share it (the default): a relay that still thinks it leads is refused by Kafka. |
 | A bad row is not skipped | A row Kafka refuses for good (too large, say) is narrowed down, everything before it goes out, then the relay stops and names the row. Skipping it would deliver later events for the same key without it. |
 | Outages are waited out | Broker or network trouble is retried with backoff, forever, and the database connection is rebuilt. A batch Kafka already has when the database goes is kept in memory and marked first once the database is back, so a lost connection repeats nothing. If marking keeps failing (a permission, say), the relay keeps retrying it and publishes nothing new, rather than sending the same batch again and again; `oldest_unsent_age_seconds` grows, so the OutboxStuck alert fires. |
 | Low lag without polling hard | A statement trigger sends `NOTIFY` on insert, delivered at commit; the relay wakes at once and only polls once a second as a safety net. |
@@ -125,13 +125,14 @@ one window where a repeat can happen, so both the kept batch and the dedupe are 
 ## Tests
 
 ```bash
-mvn -B verify      # 42 tests: unit, then Postgres and Kafka integration tests in containers
+mvn -B verify      # 43 tests: unit, then Postgres and Kafka integration tests in containers
 ```
 
 - **Unit** (19, in-memory Postgres and Kafka stand-ins): order, retries, the bad-row search, a lost connection and a
   dead process between Kafka and the database, a mark that keeps failing, leader handover, fencing, the reserved `outbox-id` header, the metrics endpoint over real HTTP,
   table names (what is refused, and that the default keeps the old object names).
-- **Postgres** (16, `OUTBOX_TEST_DB_URL` or a container): the real queries, the advisory lock, `NOTIFY` wake-up, a
+- **Postgres** (17, `OUTBOX_TEST_DB_URL` or a container): the real queries, the advisory lock (one lead per table,
+  however it is named, kept when the table is made again), `NOTIFY` wake-up, a
   late commit with a lower id, a batch kept across a reconnect marks only its own rows (never a reused id), headers the schema refuses
   (and an old row that breaks the check can still be marked sent), a second table in its own schema (its own rows, lead and wake-ups), and the inbox (once per consumer, a rollback frees the
   id, two instances racing for one id get one yes).

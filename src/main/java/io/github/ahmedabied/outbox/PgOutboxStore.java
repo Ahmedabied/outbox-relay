@@ -48,34 +48,39 @@ public final class PgOutboxStore implements OutboxStore {
              where o.id = m.id and o.sent_at is null
                and (extract(epoch from o.created_at) * 1000000)::bigint = m.created_us""";
 
+    // One lead per table: the key is the table's schema and name as Postgres resolves them, so relays given different
+    // transactional ids still take turns, and a table dropped and made again keeps its key.
+    private static final String LEAD = """
+            select pg_try_advisory_lock(hashtext('outbox-relay:' || n.nspname || '.' || c.relname))
+              from pg_class c join pg_namespace n on n.oid = c.relnamespace
+             where c.oid = {table_literal}::regclass""";
+
     private final String url;
     private final Properties props;
-    private final String lockName;
     private final OutboxTable table;
     private final String fetch;
     private final String mark;
     private final String markChecked;
+    private final String lead;
     private Connection conn;
 
     /** The default table, {@code outbox}. */
-    public PgOutboxStore(String url, Properties props, String lockName) {
-        this(url, props, lockName, OutboxTable.DEFAULT);
+    public PgOutboxStore(String url, Properties props) {
+        this(url, props, OutboxTable.DEFAULT);
     }
 
-    /**
-     * @param lockName relays that share it share one lead; use one name per outbox table
-     */
-    public PgOutboxStore(String url, Properties props, String lockName, OutboxTable table) {
+    /** Relays on the same table share one lead, whatever else differs between them. */
+    public PgOutboxStore(String url, Properties props, OutboxTable table) {
         this.url = url;
         this.props = new Properties();
         this.props.putAll(props);
         this.props.putIfAbsent("tcpKeepAlive", "true");
         this.props.putIfAbsent("ApplicationName", "outbox-relay");
-        this.lockName = lockName;
         this.table = table;
         this.fetch = table.fill(FETCH);
         this.mark = table.fill(MARK);
         this.markChecked = table.fill(MARK_CHECKED);
+        this.lead = table.fill(LEAD);
     }
 
     /** Create the default outbox table, its index and the notify trigger. Safe to run again. */
@@ -114,8 +119,7 @@ public final class PgOutboxStore implements OutboxStore {
 
     @Override
     public boolean tryLead() throws SQLException {
-        try (PreparedStatement ps = conn().prepareStatement("select pg_try_advisory_lock(hashtext(?))")) {
-            ps.setString(1, "outbox-relay:" + lockName);
+        try (PreparedStatement ps = conn().prepareStatement(lead)) {
             try (ResultSet rs = ps.executeQuery()) {
                 rs.next();
                 return rs.getBoolean(1);

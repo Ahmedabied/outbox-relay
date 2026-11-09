@@ -27,7 +27,7 @@ class PgOutboxStoreIT {
     }
 
     private static PgOutboxStore store() {
-        return new PgOutboxStore(TestDb.url(), TestDb.props(), "test");
+        return new PgOutboxStore(TestDb.url(), TestDb.props());
     }
 
     private static void sql(Connection c, String sql) throws Exception {
@@ -133,6 +133,19 @@ class PgOutboxStoreIT {
     }
 
     @Test
+    void theLeadBelongsToTheTableItself() throws Exception {
+        try (Connection c = TestDb.connect(); PgOutboxStore a = store();
+             PgOutboxStore b = new PgOutboxStore(TestDb.url(), TestDb.props(), OutboxTable.parse("public.outbox"))) {
+            assertTrue(a.tryLead());
+            assertFalse(b.tryLead()); // the same table, named another way: the same lead
+            sql(c, "drop table outbox cascade");
+            PgOutboxStore.install(c); // the table made again keeps its key: still one leader
+            assertTrue(a.tryLead());
+            assertFalse(b.tryLead());
+        }
+    }
+
+    @Test
     void anInsertWakesAWaitingRelayAtOnce() throws Exception {
         try (Connection c = TestDb.connect(); PgOutboxStore store = store()) {
             store.fetchUnsent(1); // connects and listens
@@ -169,8 +182,7 @@ class PgOutboxStoreIT {
                 PgOutboxStore.install(c, orders);
                 PgOutboxStore.install(c, orders); // safe to run again
                 try (PgOutboxStore plain = store();
-                     PgOutboxStore other = new PgOutboxStore(TestDb.url(), TestDb.props(),
-                             orders.defaultTransactionalId(), orders)) {
+                     PgOutboxStore other = new PgOutboxStore(TestDb.url(), TestDb.props(), orders)) {
                     plain.fetchUnsent(1); // both connect and listen
                     other.fetchUnsent(1);
                     sql(c, "insert into app.orders_outbox (topic, payload) values ('orders', '\\x01')");
