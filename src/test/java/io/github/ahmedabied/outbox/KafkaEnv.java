@@ -68,12 +68,17 @@ final class KafkaEnv {
         private final KafkaConsumer<String, byte[]> consumer;
 
         Consumer(String topic) {
+            this(topic, Map.of());
+        }
+
+        Consumer(String topic, Map<String, Object> extra) {
             Properties p = new Properties();
             p.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap());
             p.put(ConsumerConfig.GROUP_ID_CONFIG, "test-" + UUID.randomUUID());
             p.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
             p.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed");
             p.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+            p.putAll(extra);
             consumer = new KafkaConsumer<>(p, new StringDeserializer(), new ByteArrayDeserializer());
             consumer.subscribe(List.of(topic));
         }

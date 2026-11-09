@@ -95,11 +95,18 @@ class KafkaRelayIT {
 
     @Test
     void steadyTrafficLag() throws Exception {
+        steady("consumer defaults", Map.of());
+        steady("consumer fetch.max.wait.ms=50", Map.of("fetch.max.wait.ms", 50));
+    }
+
+    private void steady(String label, Map<String, Object> consumerSettings) throws Exception {
+        TestDb.fresh();
         String topic = KafkaEnv.newTopic(6);
         int perSecond = 1_000;
         int seconds = 10;
         int total = perSecond * seconds;
-        try (Running r = new Running("steady", 500); KafkaEnv.Consumer consumer = new KafkaEnv.Consumer(topic);
+        try (Running r = new Running("steady", 500);
+             KafkaEnv.Consumer consumer = new KafkaEnv.Consumer(topic, consumerSettings);
              Connection c = TestDb.connect();
              PreparedStatement ps = c.prepareStatement("insert into outbox (topic, msg_key, payload) values (?, ?,"
                      + " convert_to((extract(epoch from clock_timestamp()) * 1000000)::bigint::text, 'UTF8'))")) {
@@ -122,10 +129,76 @@ class KafkaRelayIT {
             assertTrue(got.get(), "timed out");
             long[] lag = consumer.seen.stream().mapToLong(s -> s.receivedMicros() - s.insertedMicros()).sorted()
                     .toArray();
-            report(String.format("steady: %,d events/s for %d s, one transaction each: insert-to-consumer lag"
-                            + " p50 %.1f ms, p99 %.1f ms, max %.1f ms; %,d batches", perSecond, seconds,
-                    lag[lag.length / 2] / 1e3, lag[(int) (lag.length * 0.99)] / 1e3, lag[lag.length - 1] / 1e3,
-                    r.relay.stats().batches.sum()));
+            Stats st = r.relay.stats();
+            report(String.format("steady, %s: %,d events/s for %d s, one transaction each. Insert to committed in"
+                            + " Kafka p50 %.1f ms, p99 %.1f ms. Insert to consumer p50 %.1f ms, p99 %.1f ms,"
+                            + " max %.1f ms. %,d Kafka transactions", label, perSecond, seconds,
+                    st.lag(0.5).toNanos() / 1e6, st.lag(0.99).toNanos() / 1e6, lag[lag.length / 2] / 1e3,
+                    lag[(int) (lag.length * 0.99)] / 1e3, lag[lag.length - 1] / 1e3, st.batches.sum()));
+        }
+    }
+
+    @Test
+    void aDeathBetweenTheKafkaCommitAndTheDatabaseMarkRepeatsThatBatchOnly() throws Exception {
+        String topic = KafkaEnv.newTopic(6);
+        int n = 5_000;
+        try (Connection c = TestDb.connect()) {
+            KafkaEnv.insert(c, topic, n, 100);
+        }
+        var real = new PgOutboxStore(TestDb.url(), TestDb.props(), "window");
+        // The third batch reaches Kafka, then the connection dies before the mark, as if the process had.
+        OutboxStore dying = new OutboxStore() {
+            int marks;
+
+            @Override
+            public boolean tryLead() throws Exception {
+                return real.tryLead();
+            }
+
+            @Override
+            public List<OutboxRow> fetchUnsent(int limit) throws Exception {
+                return real.fetchUnsent(limit);
+            }
+
+            @Override
+            public void markSent(List<Long> ids) throws Exception {
+                if (++marks == 3) {
+                    real.close();
+                    throw new java.sql.SQLException("connection lost between the Kafka commit and the mark");
+                }
+                real.markSent(ids);
+            }
+
+            @Override
+            public void awaitWork(Duration timeout) throws Exception {
+                real.awaitWork(timeout);
+            }
+
+            @Override
+            public void reset() {
+                real.reset();
+            }
+
+            @Override
+            public void close() {
+                real.close();
+            }
+        };
+        try (var publisher = new KafkaPublisher(KafkaEnv.bootstrap(), "window", Map.of());
+             KafkaEnv.Consumer consumer = new KafkaEnv.Consumer(topic)) {
+            var relay = new Relay(dying, publisher, Relay.Settings.defaults().withBatchSize(500));
+            while (relay.step() != Relay.Step.IDLE) {
+                // drain
+            }
+            dying.close();
+            assertTrue(consumer.pollUntil(x -> x.seen.size() >= n + 500, Duration.ofSeconds(30)));
+            consumer.pollUntil(x -> false, Duration.ofSeconds(1));
+            assertEquals(n + 500, consumer.seen.size()); // the third batch, twice; nothing else
+            assertEquals(n, consumer.distinct());
+            consumer.firstArrivals().forEach((key, ids) -> assertTrue(KafkaEnv.increasing(ids), key));
+            report(String.format("death between Kafka commit and database mark: %,d events, batch 500: the batch in"
+                    + " that window arrived twice (500 repeats), 0 lost, order per key kept once repeats are dropped"
+                    + " by outbox-id", n));
         }
     }
 
