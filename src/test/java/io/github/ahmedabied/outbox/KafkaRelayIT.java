@@ -1,0 +1,223 @@
+package io.github.ahmedabied.outbox;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.testcontainers.junit.jupiter.Testcontainers;
+
+/** Postgres and Kafka in containers (CI). Skipped where Docker is missing. */
+@Testcontainers(disabledWithoutDocker = true)
+class KafkaRelayIT {
+    private static final Path BENCH = Path.of("target", "bench.md");
+
+    @BeforeEach
+    void freshTable() throws Exception {
+        TestDb.fresh();
+    }
+
+    private static void report(String line) throws IOException {
+        System.out.println("BENCH " + line);
+        Files.writeString(BENCH, line + "\n", StandardCharsets.UTF_8, StandardOpenOption.CREATE,
+                StandardOpenOption.APPEND);
+    }
+
+    /** A relay running in a thread; its failure, if any, is kept for the test to look at. */
+    private static final class Running implements AutoCloseable {
+        final Relay relay;
+        final Thread thread;
+        final AtomicReference<Throwable> failure = new AtomicReference<>();
+        final PgOutboxStore store;
+        final KafkaPublisher publisher;
+
+        Running(String txId, int batch) {
+            store = new PgOutboxStore(TestDb.url(), TestDb.props(), txId);
+            publisher = new KafkaPublisher(KafkaEnv.bootstrap(), txId, Map.of());
+            relay = new Relay(store, publisher, Relay.Settings.defaults().withBatchSize(batch));
+            thread = new Thread(() -> {
+                try {
+                    relay.run();
+                } catch (Throwable t) {
+                    failure.set(t);
+                }
+            }, "relay-" + txId);
+            thread.start();
+        }
+
+        @Override
+        public void close() {
+            relay.stop();
+            try {
+                thread.join(30_000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            publisher.close();
+            store.close();
+        }
+    }
+
+    @Test
+    void aBacklogArrivesWholeAndInOrderPerKey() throws Exception {
+        String topic = KafkaEnv.newTopic(6);
+        int n = 50_000;
+        try (Connection c = TestDb.connect()) {
+            KafkaEnv.insert(c, topic, n, 100);
+        }
+        long t0 = System.nanoTime();
+        try (Running r = new Running("backlog", 500); KafkaEnv.Consumer consumer = new KafkaEnv.Consumer(topic)) {
+            assertTrue(consumer.pollUntil(x -> x.seen.size() >= n, Duration.ofSeconds(120)), "timed out");
+            double seconds = (System.nanoTime() - t0) / 1e9;
+            assertEquals(n, consumer.seen.size());
+            assertEquals(n, consumer.distinct()); // no repeats without a crash
+            consumer.firstArrivals().forEach((key, ids) -> assertTrue(KafkaEnv.increasing(ids), key));
+            report(String.format("backlog: %,d events, 100 keys, 6 partitions, batch 500: %.1f s, %,.0f events/s"
+                    + " (insert-to-commit p50 %d ms)", n, seconds, n / seconds, r.relay.stats().lag(0.5).toMillis()));
+        }
+    }
+
+    @Test
+    void steadyTrafficLag() throws Exception {
+        String topic = KafkaEnv.newTopic(6);
+        int perSecond = 1_000;
+        int seconds = 10;
+        int total = perSecond * seconds;
+        try (Running r = new Running("steady", 500); KafkaEnv.Consumer consumer = new KafkaEnv.Consumer(topic);
+             Connection c = TestDb.connect();
+             PreparedStatement ps = c.prepareStatement("insert into outbox (topic, msg_key, payload) values (?, ?,"
+                     + " convert_to((extract(epoch from clock_timestamp()) * 1000000)::bigint::text, 'UTF8'))")) {
+            consumer.pollUntil(x -> false, Duration.ofSeconds(2)); // joined the group before the traffic starts
+            AtomicReference<Boolean> got = new AtomicReference<>(false);
+            Thread reader = new Thread(() -> got.set(consumer.pollUntil(x -> x.seen.size() >= total,
+                    Duration.ofSeconds(seconds + 60))));
+            reader.start();
+            long start = System.nanoTime();
+            for (int i = 0; i < total; i++) {
+                long due = start + i * 1_000_000_000L / perSecond;
+                while (System.nanoTime() < due) {
+                    Thread.onSpinWait();
+                }
+                ps.setString(1, topic);
+                ps.setString(2, "k" + (i % 100));
+                ps.executeUpdate(); // one transaction per event, like an app
+            }
+            reader.join();
+            assertTrue(got.get(), "timed out");
+            long[] lag = consumer.seen.stream().mapToLong(s -> s.receivedMicros() - s.insertedMicros()).sorted()
+                    .toArray();
+            report(String.format("steady: %,d events/s for %d s, one transaction each: insert-to-consumer lag"
+                            + " p50 %.1f ms, p99 %.1f ms, max %.1f ms; %,d batches", perSecond, seconds,
+                    lag[lag.length / 2] / 1e3, lag[(int) (lag.length * 0.99)] / 1e3, lag[lag.length - 1] / 1e3,
+                    r.relay.stats().batches.sum()));
+        }
+    }
+
+    @Test
+    void aRowKafkaRefusesStopsTheRelayWithEverythingBeforeItDelivered() throws Exception {
+        String topic = KafkaEnv.newTopic(1);
+        try (Connection c = TestDb.connect()) {
+            KafkaEnv.insert(c, topic, 10, 3);
+            try (PreparedStatement ps = c.prepareStatement(
+                    "insert into outbox (topic, msg_key, payload) values (?, 'k1', ?)")) {
+                ps.setString(1, topic);
+                ps.setBytes(2, new byte[2 * 1024 * 1024]); // over the producer's 1 MB max.request.size
+                ps.executeUpdate();
+            }
+            KafkaEnv.insert(c, topic, 10, 3);
+        }
+        try (Running r = new Running("poison", 500); KafkaEnv.Consumer consumer = new KafkaEnv.Consumer(topic)) {
+            r.thread.join(60_000);
+            Throwable stopped = r.failure.get();
+            assertTrue(stopped instanceof RelayStoppedException, String.valueOf(stopped));
+            assertTrue(stopped.getMessage().startsWith("row 11 cannot be published"), stopped.getMessage());
+            assertTrue(stopped.getMessage().contains("RecordTooLarge"), stopped.getMessage());
+            consumer.pollUntil(x -> false, Duration.ofSeconds(3));
+            assertEquals(Fakes.range(1, 10), consumer.seen.stream().map(KafkaEnv.Seen::id).toList());
+        }
+    }
+
+    @Test
+    void aSecondPublisherWithTheSameIdFencesTheFirst() throws Exception {
+        String topic = KafkaEnv.newTopic(1);
+        var row = new OutboxRow(1, topic, "k", new byte[] {1}, Map.of(), Instant.now());
+        try (var first = new KafkaPublisher(KafkaEnv.bootstrap(), "fence", Map.of());
+             var second = new KafkaPublisher(KafkaEnv.bootstrap(), "fence", Map.of())) {
+            first.publish(List.of(row));
+            second.publish(List.of(row)); // initTransactions bumps the epoch
+            var e = assertThrows(PublishException.class, () -> first.publish(List.of(row)));
+            assertEquals(PublishException.Kind.FENCED, e.kind());
+        }
+    }
+
+    @Test
+    void killingTheRelayMidStreamLosesNothingAndKeepsOrder() throws Exception {
+        String topic = KafkaEnv.newTopic(6);
+        int n = 40_000;
+        try (Connection c = TestDb.connect()) {
+            KafkaEnv.insert(c, topic, n, 100);
+        }
+        List<Long> killedAt = new ArrayList<>();
+        try (KafkaEnv.Consumer consumer = new KafkaEnv.Consumer(topic)) {
+            for (long at : new long[] {5_000, 15_000, 25_000}) {
+                Process p = child();
+                consumer.pollUntil(x -> x.seen.size() >= at, Duration.ofSeconds(90));
+                p.destroyForcibly(); // SIGKILL: no shutdown hook, no goodbye to Postgres or Kafka
+                p.waitFor();
+                killedAt.add((long) consumer.seen.size());
+            }
+            Process last = child();
+            try {
+                assertTrue(consumer.pollUntil(x -> x.distinct() >= n, Duration.ofSeconds(120)),
+                        "only " + consumer.distinct() + " of " + n);
+            } finally {
+                last.destroy();
+                last.waitFor();
+            }
+            assertEquals(n, consumer.distinct()); // nothing lost
+            consumer.firstArrivals().forEach((key, ids) -> assertTrue(KafkaEnv.increasing(ids), key));
+            long repeats = consumer.seen.size() - n;
+            report(String.format("crash: %,d events, relay killed with SIGKILL 3 times (after %s were consumed),"
+                    + " restarted each time: 0 lost, order per key kept, %,d repeats (%.2f%%), dropped by"
+                    + " outbox-id", n, killedAt, repeats, 100.0 * repeats / n));
+        }
+    }
+
+    /** The relay as its own JVM from the built jar, the way it runs in production, so it can be killed for real. */
+    private static Process child() throws IOException {
+        String java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        Path jar = Path.of("target", "outbox-relay.jar");
+        assertTrue(Files.exists(jar), "run mvn verify: the integration tests use the packaged jar");
+        ProcessBuilder pb = new ProcessBuilder(java, "-Xmx256m", "-jar", jar.toString(), "run");
+        Map<String, String> env = pb.environment();
+        String url = TestDb.url();
+        var props = TestDb.props();
+        env.put("OUTBOX_DB_URL", url);
+        if (props.getProperty("user") != null) {
+            env.put("OUTBOX_DB_USER", props.getProperty("user"));
+            env.put("OUTBOX_DB_PASSWORD", props.getProperty("password"));
+        }
+        env.put("KAFKA_BOOTSTRAP_SERVERS", KafkaEnv.bootstrap());
+        env.put("OUTBOX_TRANSACTIONAL_ID", "crash");
+        env.put("OUTBOX_BATCH_SIZE", "200");
+        env.put("OUTBOX_STATS_SECONDS", "0");
+        pb.redirectErrorStream(true);
+        pb.redirectOutput(ProcessBuilder.Redirect.appendTo(Path.of("target", "crash-relay.log").toFile()));
+        return pb.start();
+    }
+}

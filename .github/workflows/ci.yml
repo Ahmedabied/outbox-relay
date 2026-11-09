@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["postgres:14-alpine", "postgres:18-alpine"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Build, unit tests, integration tests (Postgres and Kafka 4.4 in containers)
+        env:
+          OUTBOX_TEST_PG_IMAGE: ${{ matrix.postgres }}
+        run: mvn -B -ntp verify
+      - name: Measured numbers
+        if: always()
+        run: |
+          if [ -f target/bench.md ]; then
+            cat target/bench.md
+            { echo "### ${{ matrix.postgres }}"; sed 's/^/- /' target/bench.md; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Relay output from the crash test
+        if: failure()
+        run: tail -n 100 target/crash-relay.log || true

@@ -1,0 +1,154 @@
+package io.github.ahmedabied.outbox;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.sql.Array;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+
+import org.postgresql.PGConnection;
+
+/**
+ * The outbox table in Postgres, read over one connection that also holds the lead (a session advisory lock)
+ * and listens for inserts. If the connection drops, the lock goes with it and another relay can take over.
+ */
+public final class PgOutboxStore implements OutboxStore {
+    private static final String FETCH = """
+            select o.id, o.topic, o.msg_key, o.payload, o.created_at,
+                   case when o.headers = '{}' then null
+                        else (select array_agg(e.key order by e.key) from jsonb_each_text(o.headers) e) end,
+                   case when o.headers = '{}' then null
+                        else (select array_agg(e.value order by e.key) from jsonb_each_text(o.headers) e) end
+              from outbox o
+             where o.sent_at is null
+             order by o.id
+             limit ?""";
+
+    private final String url;
+    private final Properties props;
+    private final String lockName;
+    private Connection conn;
+
+    /**
+     * @param lockName relays that share it share one lead; use one name per outbox table
+     */
+    public PgOutboxStore(String url, Properties props, String lockName) {
+        this.url = url;
+        this.props = new Properties();
+        this.props.putAll(props);
+        this.props.putIfAbsent("tcpKeepAlive", "true");
+        this.props.putIfAbsent("ApplicationName", "outbox-relay");
+        this.lockName = lockName;
+    }
+
+    /** Create the outbox table, its index and the notify trigger. Safe to run again. */
+    public static void install(Connection conn) throws SQLException, IOException {
+        try (InputStream in = PgOutboxStore.class.getResourceAsStream("/outbox.sql");
+             Statement st = conn.createStatement()) {
+            if (in == null) {
+                throw new IOException("outbox.sql is missing from the jar");
+            }
+            st.execute(new String(in.readAllBytes(), StandardCharsets.UTF_8));
+        }
+    }
+
+    private Connection conn() throws SQLException {
+        if (conn == null) {
+            Connection c = DriverManager.getConnection(url, props);
+            try {
+                c.setAutoCommit(true);
+                try (Statement st = c.createStatement()) {
+                    st.execute("listen outbox_relay"); // before the first fetch, so no insert is missed
+                }
+            } catch (SQLException e) {
+                c.close();
+                throw e;
+            }
+            conn = c;
+        }
+        return conn;
+    }
+
+    @Override
+    public boolean tryLead() throws SQLException {
+        try (PreparedStatement ps = conn().prepareStatement("select pg_try_advisory_lock(hashtext(?))")) {
+            ps.setString(1, "outbox-relay:" + lockName);
+            try (ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                return rs.getBoolean(1);
+            }
+        }
+    }
+
+    @Override
+    public List<OutboxRow> fetchUnsent(int limit) throws SQLException {
+        List<OutboxRow> rows = new ArrayList<>(Math.min(limit, 10_000));
+        try (PreparedStatement ps = conn().prepareStatement(FETCH)) {
+            ps.setInt(1, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    rows.add(new OutboxRow(rs.getLong(1), rs.getString(2), rs.getString(3), rs.getBytes(4),
+                            headers(rs.getArray(6), rs.getArray(7)),
+                            rs.getTimestamp(5).toInstant()));
+                }
+            }
+        }
+        return rows;
+    }
+
+    private static Map<String, String> headers(Array keys, Array values) throws SQLException {
+        if (keys == null) {
+            return Map.of();
+        }
+        String[] k = (String[]) keys.getArray();
+        String[] v = (String[]) values.getArray();
+        Map<String, String> out = new HashMap<>(k.length * 2);
+        for (int i = 0; i < k.length; i++) {
+            out.put(k[i], v[i]);
+        }
+        return out;
+    }
+
+    @Override
+    public void markSent(List<Long> ids) throws SQLException {
+        try (PreparedStatement ps = conn().prepareStatement(
+                "update outbox set sent_at = clock_timestamp() where id = any(?)")) {
+            ps.setArray(1, conn().createArrayOf("bigint", ids.toArray()));
+            ps.executeUpdate();
+        }
+    }
+
+    @Override
+    public void awaitWork(Duration timeout) throws SQLException {
+        // Returns at once if a notification came in while the last batch was out.
+        conn().unwrap(PGConnection.class).getNotifications((int) Math.max(1, timeout.toMillis()));
+    }
+
+    @Override
+    public void reset() {
+        close();
+    }
+
+    @Override
+    public void close() {
+        if (conn != null) {
+            try {
+                conn.close();
+            } catch (SQLException ignored) {
+                // closing a connection that is already broken
+            }
+            conn = null;
+        }
+    }
+}
