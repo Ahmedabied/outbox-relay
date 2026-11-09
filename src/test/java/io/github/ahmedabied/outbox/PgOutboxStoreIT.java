@@ -74,6 +74,34 @@ class PgOutboxStoreIT {
     }
 
     @Test
+    void theSchemaRefusesHeadersThatWouldStopTheRelayOrFakeTheId() throws Exception {
+        try (Connection c = TestDb.connect()) {
+            for (String bad : new String[] {"'[]'", "'\"text\"'", "'{\"outbox-id\": \"1\"}'"}) {
+                var e = org.junit.jupiter.api.Assertions.assertThrows(java.sql.SQLException.class, () -> sql(c,
+                        "insert into outbox (topic, payload, headers) values ('t', '\\x00', " + bad + ")"));
+                assertTrue(e.getMessage().contains("outbox_headers_check"), e.getMessage());
+            }
+        }
+    }
+
+    @Test
+    void aNullHeaderValueIsDroppedAndAnOldTableCannotJamTheRelay() throws Exception {
+        try (Connection c = TestDb.connect(); PgOutboxStore store = store()) {
+            sql(c, "insert into outbox (topic, payload, headers) values ('t', '\\x00', '{\"a\": null, \"b\": \"x\"}')");
+            // A table from before the check, holding a row the check would refuse:
+            sql(c, "alter table outbox drop constraint outbox_headers_check");
+            sql(c, "insert into outbox (topic, payload, headers) values ('t', '\\x00', '[1, 2]')");
+            List<OutboxRow> rows = store.fetchUnsent(10);
+            assertEquals(Map.of("b", "x"), rows.get(0).headers());
+            assertEquals(Map.of(), rows.get(1).headers());
+            PgOutboxStore.install(c); // puts the check back, for new rows
+            var e = org.junit.jupiter.api.Assertions.assertThrows(java.sql.SQLException.class, () -> sql(c,
+                    "insert into outbox (topic, payload, headers) values ('t', '\\x00', '[]')"));
+            assertTrue(e.getMessage().contains("outbox_headers_check"), e.getMessage());
+        }
+    }
+
+    @Test
     void oneStoreLeadsAndTheLeadGoesWithItsConnection() throws Exception {
         try (PgOutboxStore a = store(); PgOutboxStore b = store()) {
             assertTrue(a.tryLead());

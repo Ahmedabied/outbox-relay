@@ -67,10 +67,8 @@ public final class KafkaPublisher implements Publisher {
             }
             producer.beginTransaction();
             for (OutboxRow row : rows) {
-                RecordHeaders headers = new RecordHeaders();
-                headers.add(ID_HEADER, Long.toString(row.id()).getBytes(StandardCharsets.UTF_8));
-                row.headers().forEach((k, v) -> headers.add(k, v.getBytes(StandardCharsets.UTF_8)));
-                sent.add(producer.send(new ProducerRecord<>(row.topic(), null, row.key(), row.payload(), headers)));
+                sent.add(producer.send(
+                        new ProducerRecord<>(row.topic(), null, row.key(), row.payload(), headersFor(row))));
             }
             producer.commitTransaction();
         } catch (InterruptException e) {
@@ -80,6 +78,18 @@ public final class KafkaPublisher implements Publisher {
         } catch (KafkaException e) {
             throw failure(rows, sent, e);
         }
+    }
+
+    /** The row's headers, then the outbox id, which no row header can replace (the schema refuses one too). */
+    static RecordHeaders headersFor(OutboxRow row) {
+        RecordHeaders headers = new RecordHeaders();
+        row.headers().forEach((k, v) -> {
+            if (!k.equals(ID_HEADER)) {
+                headers.add(k, v.getBytes(StandardCharsets.UTF_8));
+            }
+        });
+        headers.add(ID_HEADER, Long.toString(row.id()).getBytes(StandardCharsets.UTF_8));
+        return headers;
     }
 
     private PublishException failure(List<OutboxRow> rows, List<Future<RecordMetadata>> sent, KafkaException e) {

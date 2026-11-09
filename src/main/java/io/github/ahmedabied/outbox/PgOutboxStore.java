@@ -26,10 +26,12 @@ import org.postgresql.PGConnection;
 public final class PgOutboxStore implements OutboxStore {
     private static final String FETCH = """
             select o.id, o.topic, o.msg_key, o.payload, o.created_at,
-                   case when o.headers = '{}' then null
-                        else (select array_agg(e.key order by e.key) from jsonb_each_text(o.headers) e) end,
-                   case when o.headers = '{}' then null
-                        else (select array_agg(e.value order by e.key) from jsonb_each_text(o.headers) e) end
+                   case when o.headers = '{}' or jsonb_typeof(o.headers) <> 'object' then null
+                        else (select array_agg(e.key order by e.key)
+                                from jsonb_each_text(jsonb_strip_nulls(o.headers)) e) end,
+                   case when o.headers = '{}' or jsonb_typeof(o.headers) <> 'object' then null
+                        else (select array_agg(e.value order by e.key)
+                                from jsonb_each_text(jsonb_strip_nulls(o.headers)) e) end
               from outbox o
              where o.sent_at is null
              order by o.id
@@ -107,6 +109,8 @@ public final class PgOutboxStore implements OutboxStore {
         return rows;
     }
 
+    // The schema allows only an object without outbox-id; nulls are stripped above. A table made some other way
+    // still cannot stop the relay: anything else is read as no headers.
     private static Map<String, String> headers(Array keys, Array values) throws SQLException {
         if (keys == null) {
             return Map.of();

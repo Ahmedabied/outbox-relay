@@ -6,10 +6,22 @@ create table if not exists outbox (
     topic      text        not null,
     msg_key    text,
     payload    bytea       not null,
-    headers    jsonb       not null default '{}',
+    headers    jsonb       not null default '{}'
+               constraint outbox_headers_check
+               check (jsonb_typeof(headers) = 'object' and not headers ? 'outbox-id'),
     created_at timestamptz not null default clock_timestamp(),
     sent_at    timestamptz
 );
+
+-- Tables made by an older version get the header check too (new rows only; old rows are not scanned).
+do $$
+begin
+    if not exists (select 1 from pg_constraint where conname = 'outbox_headers_check') then
+        alter table outbox add constraint outbox_headers_check
+            check (jsonb_typeof(headers) = 'object' and not headers ? 'outbox-id') not valid;
+    end if;
+end
+$$;
 
 -- The relay reads only unsent rows, in id order: this index stays as small as the backlog.
 create index if not exists outbox_unsent on outbox (id) where sent_at is null;
