@@ -26,7 +26,7 @@ java -jar target/outbox-relay.jar init       # outbox table, index, notify trigg
 java -jar target/outbox-relay.jar run        # SIGTERM lets the batch in hand finish, then exits
 ```
 
-Consumers read with `isolation.level=read_committed` and drop a repeat by the `outbox-id` header (see below).
+Consumers read with `isolation.level=read_committed` and drop a repeat by its `outbox-id` header (`Inbox`, below).
 
 ## How it keeps its promises
 
@@ -40,8 +40,19 @@ Consumers read with `isolation.level=read_committed` and drop a repeat by the `o
 | Low lag without polling hard | A statement trigger sends `NOTIFY` on insert, delivered at commit; the relay wakes at once and only polls once a second as a safety net. |
 
 The one thing it cannot do is exactly once: if the relay dies after Kafka commits and before the database marks the
-rows, that batch is published again. Every record carries an `outbox-id` header so consumers can drop the repeat
-(keep processed ids in a table with a unique key, in the same transaction as the consumer's own write).
+rows, that batch is published again. Every record carries an `outbox-id` header, and a consumer that writes to
+Postgres can use `Inbox` to handle each event once: it records the id in the same transaction as the consumer's own
+write, so a repeat is skipped and a rolled-back write frees the id again.
+
+```java
+conn.setAutoCommit(false);
+if (Inbox.claim(conn, "billing", Inbox.outboxId(record.headers()))) {
+    // the consumer's own writes, on the same connection
+}
+conn.commit();
+```
+
+`Inbox.install(conn)` creates its table. A claim with autocommit on is refused, because it would commit on its own.
 
 ## Measured
 
@@ -53,7 +64,7 @@ Postgres 14 and 18, every number from the integration tests in `KafkaRelayIT`:
 | A backlog of 50,000 events, 100 keys, 6 partitions, batch 500 | 32,000 to 53,000 events/s (median about 34,800), 100 Kafka transactions |
 | Steady traffic, 1,000 events/s, one app transaction per event | insert to consumer p50 3.6 to 13.6 ms; p99 57 to 102 ms in 7 of 8 measurements, 461 ms once |
 | Relay JVM killed with SIGKILL 5 times mid-stream (12,000 to 36,000 rows unsent at each kill), restarted each time | 0 lost, order per key kept, 0 or 200 repeats (up to 0.5%) |
-| Database connection lost right after a Kafka commit, before the mark | that batch arrives twice (500 repeats), nothing else; 0 lost |
+| Database connection lost right after a Kafka commit, before the mark | that batch arrives twice (500 repeats), nothing else; 0 lost; a consumer using `Inbox` handles each of the 5,000 events once |
 
 The steady tail is the Kafka commit itself (the relay's own insert to commit p99 is 61 to 99 ms); a consumer with
 `fetch.max.wait.ms=50` measured the same. The SIGKILL test mostly lands between batches; the second test forces the
@@ -62,16 +73,17 @@ one window where a repeat can happen, so the dedupe is shown, not assumed.
 ## Tests
 
 ```bash
-mvn -B verify      # 24 tests: unit, then Postgres and Kafka integration tests in containers
+mvn -B verify      # 29 tests: unit, then Postgres and Kafka integration tests in containers
 ```
 
 - **Unit** (10, in-memory Postgres and Kafka stand-ins): order, retries, the bad-row search, a crash between Kafka
   and the database, leader handover, fencing, the reserved `outbox-id` header.
-- **Postgres** (8, `OUTBOX_TEST_DB_URL` or a container): the real queries, the advisory lock, `NOTIFY` wake-up, a
-  late commit with a lower id, headers the schema refuses.
+- **Postgres** (13, `OUTBOX_TEST_DB_URL` or a container): the real queries, the advisory lock, `NOTIFY` wake-up, a
+  late commit with a lower id, headers the schema refuses, and the inbox (once per consumer, a rollback frees the
+  id, two instances racing for one id get one yes).
 - **Kafka 4.4 + Postgres** (6, containers, skipped without Docker): the backlog, steady traffic, a 2 MB row the
   producer refuses, fencing between two publishers, the SIGKILL test (the relay runs as its own JVM from the built
-  jar) and the forced repeat.
+  jar) and the forced repeat, run through `Inbox`.
 
 CI runs everything on Postgres 14 and 18.
 
@@ -80,8 +92,8 @@ CI runs everything on Postgres 14 and 18.
 - Order holds per key for rows that commit in id order. Two transactions that write the same key at the same time,
   without locking a shared row, have no defined order to keep: lock the aggregate row, as you would anyway.
 - Consumers that read with `read_uncommitted` (the Kafka default) can see aborted batches. Use `read_committed`.
-- Sent rows stay in the table with `sent_at` set. Delete old ones on a schedule:
-  `delete from outbox where sent_at < now() - interval '7 days'`.
+- Sent rows stay in the table with `sent_at` set, and inbox rows stay too. Delete old ones on a schedule:
+  `delete from outbox where sent_at < now() - interval '7 days'`; keep inbox rows longer than a relay could be down.
 - The table name is fixed (`outbox`) and the relay works one table per process.
 - Lag numbers depend on the machine; the ones here come from GitHub's shared CI runners.
 

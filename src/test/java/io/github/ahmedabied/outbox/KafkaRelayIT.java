@@ -11,6 +11,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
+import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -196,9 +197,30 @@ class KafkaRelayIT {
             assertEquals(n + 500, consumer.seen.size()); // the third batch, twice; nothing else
             assertEquals(n, consumer.distinct());
             consumer.firstArrivals().forEach((key, ids) -> assertTrue(KafkaEnv.increasing(ids), key));
+
+            // A consumer that writes to Postgres, with the inbox: every record, repeats included, goes through it.
+            int handled = 0;
+            try (Connection c = TestDb.connect(); Statement st = c.createStatement()) {
+                st.execute("drop table if exists outbox_inbox; drop table if exists projection;"
+                        + " create table projection (outbox_id bigint primary key, msg_key text not null)");
+                Inbox.install(c);
+                c.setAutoCommit(false);
+                try (PreparedStatement ps = c.prepareStatement("insert into projection values (?, ?)")) {
+                    for (KafkaEnv.Seen s : consumer.seen) {
+                        if (Inbox.claim(c, "projection", s.id())) {
+                            ps.setLong(1, s.id());
+                            ps.setString(2, s.key());
+                            ps.executeUpdate(); // a repeat would break this primary key
+                            handled++;
+                        }
+                        c.commit();
+                    }
+                }
+            }
+            assertEquals(n, handled);
             report(String.format("death between Kafka commit and database mark: %,d events, batch 500: the batch in"
-                    + " that window arrived twice (500 repeats), 0 lost, order per key kept once repeats are dropped"
-                    + " by outbox-id", n));
+                    + " that window arrived twice (500 repeats), 0 lost, order per key kept; a consumer using Inbox"
+                    + " handled %,d of %,d records and skipped the 500 repeats", n, handled, consumer.seen.size()));
         }
     }
 

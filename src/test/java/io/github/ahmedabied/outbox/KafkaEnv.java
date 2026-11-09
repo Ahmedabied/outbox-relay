@@ -17,7 +17,6 @@ import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
-import org.apache.kafka.common.header.Header;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.testcontainers.kafka.KafkaContainer;
@@ -88,8 +87,7 @@ final class KafkaEnv {
             long end = System.nanoTime() + timeout.toNanos();
             while (!done.test(this) && System.nanoTime() < end) {
                 for (ConsumerRecord<String, byte[]> r : consumer.poll(Duration.ofMillis(100))) {
-                    Header h = r.headers().lastHeader(KafkaPublisher.ID_HEADER);
-                    long id = Long.parseLong(new String(h.value(), StandardCharsets.UTF_8));
+                    long id = Inbox.outboxId(r.headers());
                     long inserted = parseOrZero(r.value());
                     seen.add(new Seen(id, r.key(), inserted, java.time.temporal.ChronoUnit.MICROS.between(java.time.Instant.EPOCH, java.time.Instant.now())));
                 }
