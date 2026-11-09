@@ -131,7 +131,7 @@ mvn -B verify      # 42 tests: unit, then Postgres and Kafka integration tests i
   dead process between Kafka and the database, a mark that keeps failing, leader handover, fencing, the reserved `outbox-id` header, the metrics endpoint over real HTTP,
   table names (what is refused, and that the default keeps the old object names).
 - **Postgres** (16, `OUTBOX_TEST_DB_URL` or a container): the real queries, the advisory lock, `NOTIFY` wake-up, a
-  late commit with a lower id, only the very rows published get marked (not a reused id), headers the schema refuses
+  late commit with a lower id, a batch kept across a reconnect marks only its own rows (never a reused id), headers the schema refuses
   (and an old row that breaks the check can still be marked sent), a second table in its own schema (its own rows, lead and wake-ups), and the inbox (once per consumer, a rollback frees the
   id, two instances racing for one id get one yes).
 - **Kafka 4.4 + Postgres** (7, containers, skipped without Docker): the backlog, steady traffic, a 2 MB row the

@@ -155,6 +155,11 @@ class KafkaRelayIT {
             }
 
             @Override
+            public void markSentAfterReconnect(List<OutboxRow> rows) throws Exception {
+                real.markSentAfterReconnect(rows);
+            }
+
+            @Override
             public void markSent(List<OutboxRow> rows) throws Exception {
                 if (++marks == 3) {
                     real.close();

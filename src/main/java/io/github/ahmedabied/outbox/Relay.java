@@ -115,7 +115,7 @@ public final class Relay {
                 LOG.info("leading: this relay publishes now");
             }
             if (unmarked != null) {
-                markUnmarked(); // what Kafka already has, before anything new
+                markUnmarked(true); // what Kafka already has, before anything new
                 return Step.PUBLISHED;
             }
             List<OutboxRow> rows = store.fetchUnsent(limit);
@@ -133,7 +133,7 @@ public final class Relay {
             int asked = limit;
             limit = suspectNext ? 1 : settings.batchSize(); // the row Kafka named comes next: try it alone
             suspectNext = false;
-            markUnmarked(); // a process that dies before this line publishes the batch again: a duplicate, never a loss
+            markUnmarked(false); // a process that dies before this line publishes the batch again: a duplicate, never a loss
             return rows.size() == asked ? Step.FULL : Step.PUBLISHED;
         } catch (InterruptedException | RelayStoppedException e) {
             throw e;
@@ -152,8 +152,12 @@ public final class Relay {
         }
     }
 
-    private void markUnmarked() throws Exception {
-        store.markSent(unmarked);
+    private void markUnmarked(boolean afterReconnect) throws Exception {
+        if (afterReconnect) {
+            store.markSentAfterReconnect(unmarked);
+        } else {
+            store.markSent(unmarked);
+        }
         stats.published(unmarked, committedAt);
         unmarked = null;
         failuresInARow = 0;

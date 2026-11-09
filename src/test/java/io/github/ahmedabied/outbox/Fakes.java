@@ -69,6 +69,11 @@ final class Fakes {
         }
 
         @Override
+        public void markSentAfterReconnect(List<OutboxRow> rows) throws SQLException {
+            markSent(rows);
+        }
+
+        @Override
         public void markSent(List<OutboxRow> rows) throws SQLException {
             if (failMarks > 0) {
                 failMarks--;

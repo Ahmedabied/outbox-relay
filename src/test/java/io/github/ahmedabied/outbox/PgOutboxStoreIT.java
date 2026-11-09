@@ -213,7 +213,7 @@ class PgOutboxStoreIT {
                 rs.next();
                 firstMark = rs.getString(1);
             }
-            store.markSent(published); // marked again later (a remembered batch): stays as it was
+            store.markSentAfterReconnect(published); // marked again after a reconnect: stays as it was
             try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery("select sent_at::text from outbox")) {
                 rs.next();
                 assertEquals(firstMark, rs.getString(1));
@@ -221,7 +221,7 @@ class PgOutboxStoreIT {
             // The identity starts again and a new row gets the same id: a remembered batch must not mark it.
             sql(c, "truncate outbox restart identity");
             insert(c, 1);
-            store.markSent(published);
+            store.markSentAfterReconnect(published);
             assertEquals(List.of(1L), ids(store.fetchUnsent(10)));
         }
     }
