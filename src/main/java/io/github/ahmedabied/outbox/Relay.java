@@ -53,7 +53,7 @@ public final class Relay {
     private final Clock clock;
     private final Stats stats = new Stats();
 
-    private boolean leading;
+    private volatile boolean leading;
     private int limit;
     private int failuresInARow;
     private long rejectedRow = -1;
@@ -109,6 +109,7 @@ public final class Relay {
                 LOG.info("leading: this relay publishes now");
             }
             List<OutboxRow> rows = store.fetchUnsent(limit);
+            stats.fetched(rows, clock.instant());
             if (rows.isEmpty()) {
                 return Step.IDLE;
             }

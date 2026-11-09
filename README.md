@@ -54,9 +54,30 @@ conn.commit();
 
 `Inbox.install(conn)` creates its table. A claim with autocommit on is refused, because it would commit on its own.
 
+## Metrics
+
+Set `OUTBOX_METRICS_ADDR=9464` and the relay serves Prometheus metrics at `http://127.0.0.1:9464/metrics` (a bare
+port binds to localhost; give `0.0.0.0:9464` to expose it). Off when unset. The endpoint reads the relay's own
+counters, never the database, and answers only `GET /metrics`.
+
+`outbox_relay_published_total`, `batches_total`, `retries_total`, `rejections_total`, `database_errors_total`,
+`leading` (1 on the relay that publishes), `lag_seconds{quantile="0.5"|"0.99"}` (insert to Kafka commit), and the
+one to page on:
+
+```yaml
+- alert: OutboxStuck
+  expr: max(outbox_relay_oldest_unsent_age_seconds) > 60 or absent(outbox_relay_leading == 1)
+  for: 2m
+  annotations:
+    summary: "Events are waiting in the outbox (broker down, a refused row, or no relay leading)"
+```
+
+`oldest_unsent_age_seconds` is the age of the first unsent row at the relay's last read, recorded in its own loop,
+so it keeps growing while Kafka is down and the relay retries.
+
 ## Measured
 
-From CI (GitHub's shared runners, 2 CPUs, Postgres and a single Kafka 4.4 broker in containers), three runs on
+From CI (GitHub's shared runners, 2 CPUs, Postgres and a single Kafka 4.4 broker in containers), runs on
 Postgres 14 and 18, every number from the integration tests in `KafkaRelayIT`:
 
 | What | Result |
@@ -73,11 +94,11 @@ one window where a repeat can happen, so the dedupe is shown, not assumed.
 ## Tests
 
 ```bash
-mvn -B verify      # 29 tests: unit, then Postgres and Kafka integration tests in containers
+mvn -B verify      # 32 tests: unit, then Postgres and Kafka integration tests in containers
 ```
 
-- **Unit** (10, in-memory Postgres and Kafka stand-ins): order, retries, the bad-row search, a crash between Kafka
-  and the database, leader handover, fencing, the reserved `outbox-id` header.
+- **Unit** (13, in-memory Postgres and Kafka stand-ins): order, retries, the bad-row search, a crash between Kafka
+  and the database, leader handover, fencing, the reserved `outbox-id` header, the metrics endpoint over real HTTP.
 - **Postgres** (13, `OUTBOX_TEST_DB_URL` or a container): the real queries, the advisory lock, `NOTIFY` wake-up, a
   late commit with a lower id, headers the schema refuses, and the inbox (once per consumer, a rollback frees the
   id, two instances racing for one id get one yes).

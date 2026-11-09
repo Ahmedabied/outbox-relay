@@ -18,6 +18,25 @@ public final class Stats {
 
     private final long[] lagMicros = new long[WINDOW];
     private long recorded;
+    private volatile long lastFetchMillis;
+    private volatile long oldestUnsentMillis;
+
+    /** Recorded at every fetch, in the relay's own thread, so reading it never touches the database. */
+    void fetched(List<OutboxRow> rows, Instant now) {
+        lastFetchMillis = now.toEpochMilli();
+        oldestUnsentMillis = rows.isEmpty() ? 0 : Math.max(0, Duration.between(rows.get(0).createdAt(), now).toMillis());
+    }
+
+    /** Age of the first unsent row at the last fetch; zero when the outbox was empty then. */
+    public Duration oldestUnsentAge() {
+        return Duration.ofMillis(oldestUnsentMillis);
+    }
+
+    /** When the relay last read the outbox, or null if it never has (a standby, say). */
+    public Instant lastFetch() {
+        long t = lastFetchMillis;
+        return t == 0 ? null : Instant.ofEpochMilli(t);
+    }
 
     synchronized void published(List<OutboxRow> rows, Instant now) {
         for (OutboxRow row : rows) {

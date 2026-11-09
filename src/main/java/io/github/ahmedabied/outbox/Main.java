@@ -36,6 +36,7 @@ public final class Main {
               OUTBOX_TRANSACTIONAL_ID  default outbox-relay; one per outbox table
               OUTBOX_BATCH_SIZE        default 500
               OUTBOX_STATS_SECONDS     print counters and lag this often, default 30 (0: never)
+              OUTBOX_METRICS_ADDR      serve Prometheus metrics at /metrics: PORT (127.0.0.1) or HOST:PORT; off if unset
             """;
 
     private Main() {
@@ -65,6 +66,11 @@ public final class Main {
         PgOutboxStore store = new PgOutboxStore(url, db, txId);
         KafkaPublisher publisher = new KafkaPublisher(need("KAFKA_BOOTSTRAP_SERVERS"), txId, Map.of());
         Relay relay = new Relay(store, publisher, settings);
+        String metricsAddr = env("OUTBOX_METRICS_ADDR", "");
+        MetricsServer metrics = metricsAddr.isEmpty() ? null : new MetricsServer(MetricsServer.parse(metricsAddr), relay);
+        if (metrics != null) {
+            LOG.info("metrics at http://" + metricsAddr + "/metrics");
+        }
         CountDownLatch done = new CountDownLatch(1);
         Thread worker = Thread.currentThread();
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -103,6 +109,9 @@ public final class Main {
         } catch (InterruptedException e) {
             LOG.warning("stopped while waiting on Kafka or the database; the batch in hand will be published again");
         } finally {
+            if (metrics != null) {
+                metrics.close();
+            }
             publisher.close();
             store.close();
             LOG.info(relay.stats().toString());
