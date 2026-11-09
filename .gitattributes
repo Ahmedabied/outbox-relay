@@ -1,0 +1,2 @@
+# The Python consumer is real code, not documentation: count it, so code scanning covers it too.
+examples/** linguist-documentation=false
