@@ -68,7 +68,7 @@ class PgOutboxStoreIT {
             assertNull(rows.get(1).key());
             assertArrayEquals(new byte[] {0, (byte) 0xff}, rows.get(1).payload());
             assertEquals(Map.of(), rows.get(1).headers());
-            store.markSent(ids(rows));
+            store.markSent(rows);
             assertEquals(range(6, 12), ids(store.fetchUnsent(100)));
         }
     }
@@ -98,7 +98,7 @@ class PgOutboxStoreIT {
             var e = org.junit.jupiter.api.Assertions.assertThrows(java.sql.SQLException.class, () -> sql(c,
                     "insert into outbox (topic, payload, headers) values ('t', '\\x00', '[]')"));
             assertTrue(e.getMessage().contains("outbox_headers_check"), e.getMessage());
-            store.markSent(ids(rows)); // the old row can still be marked sent, or the relay would send it forever
+            store.markSent(rows); // the old row can still be marked sent, or the relay would send it forever
             assertEquals(0, store.fetchUnsent(10).size());
         }
     }
@@ -112,7 +112,7 @@ class PgOutboxStoreIT {
             sql(c, "alter table outbox add constraint outbox_headers_check"
                     + " check (jsonb_typeof(headers) = 'object' and not headers ? 'outbox-id') not valid");
             PgOutboxStore.install(c);
-            store.markSent(ids(store.fetchUnsent(10)));
+            store.markSent(store.fetchUnsent(10));
             assertEquals(0, store.fetchUnsent(10).size());
             var e = org.junit.jupiter.api.Assertions.assertThrows(java.sql.SQLException.class, () -> sql(c,
                     "insert into outbox (topic, payload, headers) values ('t', '\\x00', '{\"outbox-id\": \"9\"}')"));
@@ -189,7 +189,7 @@ class PgOutboxStoreIT {
                     assertEquals(List.of(1L, 2L), ids(plain.fetchUnsent(10)));
                     List<OutboxRow> mine = other.fetchUnsent(10);
                     assertEquals(List.of(1L), ids(mine)); // its own ids
-                    other.markSent(ids(mine));
+                    other.markSent(mine);
                     assertEquals(2, plain.fetchUnsent(10).size()); // marking one table leaves the other alone
                     assertEquals(0, other.fetchUnsent(10).size());
                     var e = org.junit.jupiter.api.Assertions.assertThrows(java.sql.SQLException.class, () -> sql(c,
@@ -203,13 +203,38 @@ class PgOutboxStoreIT {
     }
 
     @Test
+    void onlyTheVeryRowsPublishedAreMarked() throws Exception {
+        try (Connection c = TestDb.connect(); PgOutboxStore store = store()) {
+            insert(c, 1);
+            List<OutboxRow> published = store.fetchUnsent(10);
+            store.markSent(published);
+            String firstMark;
+            try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery("select sent_at::text from outbox")) {
+                rs.next();
+                firstMark = rs.getString(1);
+            }
+            store.markSent(published); // marked again later (a remembered batch): stays as it was
+            try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery("select sent_at::text from outbox")) {
+                rs.next();
+                assertEquals(firstMark, rs.getString(1));
+            }
+            // The identity starts again and a new row gets the same id: a remembered batch must not mark it.
+            sql(c, "truncate outbox restart identity");
+            insert(c, 1);
+            store.markSent(published);
+            assertEquals(List.of(1L), ids(store.fetchUnsent(10)));
+        }
+    }
+
+    @Test
     void aRowThatCommitsLateWithALowerIdIsNotSkipped() throws Exception {
         try (Connection slow = TestDb.connect(); Connection fast = TestDb.connect(); PgOutboxStore store = store()) {
             slow.setAutoCommit(false);
             insert(slow, 1); // takes id 1, not committed yet
             insert(fast, 1); // takes id 2, committed
-            assertEquals(List.of(2L), ids(store.fetchUnsent(10)));
-            store.markSent(List.of(2L));
+            List<OutboxRow> committed = store.fetchUnsent(10);
+            assertEquals(List.of(2L), ids(committed));
+            store.markSent(committed);
             slow.commit();
             assertEquals(List.of(1L), ids(store.fetchUnsent(10))); // no high-water mark, so nothing is passed over
         }

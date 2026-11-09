@@ -69,13 +69,13 @@ final class Fakes {
         }
 
         @Override
-        public void markSent(List<Long> ids) throws SQLException {
+        public void markSent(List<OutboxRow> rows) throws SQLException {
             if (failMarks > 0) {
                 failMarks--;
                 throw new SQLException("connection lost");
             }
             synchronized (db) {
-                db.sent.addAll(ids);
+                db.sent.addAll(ids(rows));
             }
         }
 

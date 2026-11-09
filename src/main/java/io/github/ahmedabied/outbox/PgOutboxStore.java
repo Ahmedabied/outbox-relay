@@ -37,6 +37,13 @@ public final class PgOutboxStore implements OutboxStore {
              order by o.id
              limit ?""";
 
+    // By id and creation time (microseconds, as Postgres keeps it), so only the very rows that were published.
+    private static final String MARK = """
+            update {table} o set sent_at = clock_timestamp()
+              from unnest(?::bigint[], ?::bigint[]) as m(id, created_us)
+             where o.id = m.id and o.sent_at is null
+               and (extract(epoch from o.created_at) * 1000000)::bigint = m.created_us""";
+
     private final String url;
     private final Properties props;
     private final String lockName;
@@ -62,7 +69,7 @@ public final class PgOutboxStore implements OutboxStore {
         this.lockName = lockName;
         this.table = table;
         this.fetch = table.fill(FETCH);
-        this.mark = table.fill("update {table} set sent_at = clock_timestamp() where id = any(?)");
+        this.mark = table.fill(MARK);
     }
 
     /** Create the default outbox table, its index and the notify trigger. Safe to run again. */
@@ -142,9 +149,17 @@ public final class PgOutboxStore implements OutboxStore {
     }
 
     @Override
-    public void markSent(List<Long> ids) throws SQLException {
+    public void markSent(List<OutboxRow> rows) throws SQLException {
+        Long[] ids = new Long[rows.size()];
+        Long[] created = new Long[rows.size()];
+        for (int i = 0; i < ids.length; i++) {
+            OutboxRow r = rows.get(i);
+            ids[i] = r.id();
+            created[i] = r.createdAt().getEpochSecond() * 1_000_000L + r.createdAt().getNano() / 1_000;
+        }
         try (PreparedStatement ps = conn().prepareStatement(mark)) {
-            ps.setArray(1, conn().createArrayOf("bigint", ids.toArray()));
+            ps.setArray(1, conn().createArrayOf("bigint", ids));
+            ps.setArray(2, conn().createArrayOf("bigint", created));
             ps.executeUpdate();
         }
     }

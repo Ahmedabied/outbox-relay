@@ -2,7 +2,7 @@ package io.github.ahmedabied.outbox;
 
 import java.time.Clock;
 import java.time.Duration;
-import java.util.ArrayList;
+import java.time.Instant;
 import java.util.List;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -14,8 +14,10 @@ import java.util.logging.Logger;
  * <p>The rules it keeps:
  * <ul>
  *   <li>Rows are published in id order. A batch reaches consumers whole or not at all, so a retry cannot reorder.
- *   <li>A row is marked sent only after Kafka has it. A crash in between publishes the batch again: duplicates,
- *       never a loss. Consumers drop a repeat by its {@code outbox-id} header.
+ *   <li>A row is marked sent only after Kafka has it. If the database is lost in between, the relay remembers the
+ *       batch and marks it first once it leads again, so nothing is published twice. A process that dies there
+ *       forgets it, and the next relay publishes that batch again: duplicates, never a loss. Consumers drop a
+ *       repeat by its {@code outbox-id} header.
  *   <li>A row Kafka refuses for good (too large, say) is narrowed down by shrinking the batch, everything before it
  *       goes out, and then the relay stops and names it. It never skips a row, because what comes after it for the
  *       same key would then arrive without it.
@@ -58,6 +60,9 @@ public final class Relay {
     private int failuresInARow;
     private long rejectedRow = -1;
     private int rejections;
+    // A batch whose Kafka transaction committed and that the database has not marked yet, and when it committed.
+    private List<OutboxRow> unmarked;
+    private Instant committedAt;
     private boolean suspectNext;
     private volatile boolean stopping;
 
@@ -103,10 +108,15 @@ public final class Relay {
             if (!leading) {
                 leading = store.tryLead();
                 if (!leading) {
+                    unmarked = null; // the relay that leads now sends those rows itself (a repeat, never a loss)
                     return Step.STANDBY;
                 }
                 limit = settings.batchSize();
                 LOG.info("leading: this relay publishes now");
+            }
+            if (unmarked != null) {
+                markUnmarked(); // what Kafka already has, before anything new
+                return Step.PUBLISHED;
             }
             List<OutboxRow> rows = store.fetchUnsent(limit);
             stats.fetched(rows, clock.instant());
@@ -118,21 +128,20 @@ public final class Relay {
             } catch (PublishException e) {
                 return failed(rows, e);
             }
-            List<Long> ids = new ArrayList<>(rows.size());
-            for (OutboxRow row : rows) {
-                ids.add(row.id());
-            }
-            store.markSent(ids); // dying before this line publishes the batch again: a duplicate, never a loss
-            stats.published(rows, clock.instant());
-            failuresInARow = 0;
+            unmarked = rows;
+            committedAt = clock.instant();
             int asked = limit;
             limit = suspectNext ? 1 : settings.batchSize(); // the row Kafka named comes next: try it alone
             suspectNext = false;
+            markUnmarked(); // a process that dies before this line publishes the batch again: a duplicate, never a loss
             return rows.size() == asked ? Step.FULL : Step.PUBLISHED;
         } catch (InterruptedException | RelayStoppedException e) {
             throw e;
         } catch (Exception e) { // the database: the connection, and the lead that lives on it, is gone
-            if (leading) {
+            if (unmarked != null) {
+                LOG.log(Level.WARNING, "database trouble with " + unmarked.size() + " rows in Kafka but not marked sent;"
+                        + " they are marked before anything new is published, connecting again: " + e);
+            } else if (leading) {
                 LOG.log(Level.WARNING, "database trouble, giving up the lead and connecting again: " + e);
             }
             leading = false;
@@ -141,6 +150,13 @@ public final class Relay {
             backoff();
             return Step.RETRY;
         }
+    }
+
+    private void markUnmarked() throws Exception {
+        store.markSent(unmarked);
+        stats.published(unmarked, committedAt);
+        unmarked = null;
+        failuresInARow = 0;
     }
 
     private Step failed(List<OutboxRow> rows, PublishException e) throws InterruptedException {

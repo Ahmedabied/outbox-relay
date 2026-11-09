@@ -12,8 +12,11 @@ public interface OutboxStore extends AutoCloseable {
     /** Unsent rows in id order, at most limit. */
     List<OutboxRow> fetchUnsent(int limit) throws Exception;
 
-    /** Record that these rows are in Kafka. */
-    void markSent(List<Long> ids) throws Exception;
+    /**
+     * Record that these rows are in Kafka. A row matches by id and creation time, so a row that is gone, or an id
+     * used again after the identity was reset, is never marked; a row already marked stays as it was.
+     */
+    void markSent(List<OutboxRow> rows) throws Exception;
 
     /** Wait until new rows may have arrived, or until the timeout. */
     void awaitWork(Duration timeout) throws Exception;

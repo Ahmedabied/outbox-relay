@@ -139,16 +139,9 @@ class KafkaRelayIT {
         }
     }
 
-    @Test
-    void aDeathBetweenTheKafkaCommitAndTheDatabaseMarkRepeatsThatBatchOnly() throws Exception {
-        String topic = KafkaEnv.newTopic(6);
-        int n = 5_000;
-        try (Connection c = TestDb.connect()) {
-            KafkaEnv.insert(c, topic, n, 100);
-        }
-        var real = new PgOutboxStore(TestDb.url(), TestDb.props(), "window");
-        // The third batch reaches Kafka, then the connection dies before the mark, as if the process had.
-        OutboxStore dying = new OutboxStore() {
+    /** The real store, except that its third mark fails after the Kafka commit: the connection dies there. */
+    private static OutboxStore dyingAtTheThirdMark(PgOutboxStore real) {
+        return new OutboxStore() {
             int marks;
 
             @Override
@@ -162,12 +155,12 @@ class KafkaRelayIT {
             }
 
             @Override
-            public void markSent(List<Long> ids) throws Exception {
+            public void markSent(List<OutboxRow> rows) throws Exception {
                 if (++marks == 3) {
                     real.close();
                     throw new java.sql.SQLException("connection lost between the Kafka commit and the mark");
                 }
-                real.markSent(ids);
+                real.markSent(rows);
             }
 
             @Override
@@ -185,13 +178,56 @@ class KafkaRelayIT {
                 real.close();
             }
         };
-        try (var publisher = new KafkaPublisher(KafkaEnv.bootstrap(), "window", Map.of());
+    }
+
+    @Test
+    void aConnectionLostBetweenTheKafkaCommitAndTheDatabaseMarkRepeatsNothing() throws Exception {
+        String topic = KafkaEnv.newTopic(6);
+        int n = 5_000;
+        try (Connection c = TestDb.connect()) {
+            KafkaEnv.insert(c, topic, n, 100);
+        }
+        var real = new PgOutboxStore(TestDb.url(), TestDb.props(), "window-kept");
+        OutboxStore dying = dyingAtTheThirdMark(real);
+        try (var publisher = new KafkaPublisher(KafkaEnv.bootstrap(), "window-kept", Map.of());
              KafkaEnv.Consumer consumer = new KafkaEnv.Consumer(topic)) {
             var relay = new Relay(dying, publisher, Relay.Settings.defaults().withBatchSize(500));
             while (relay.step() != Relay.Step.IDLE) {
-                // drain
+                // the same relay connects again, marks the batch it remembers, and goes on
             }
             dying.close();
+            assertTrue(consumer.pollUntil(x -> x.seen.size() >= n, Duration.ofSeconds(30)));
+            consumer.pollUntil(x -> false, Duration.ofSeconds(1));
+            assertEquals(n, consumer.seen.size()); // nothing twice
+            assertEquals(n, consumer.distinct());
+            assertEquals(1, relay.stats().databaseErrors.sum());
+            consumer.firstArrivals().forEach((key, ids) -> assertTrue(KafkaEnv.increasing(ids), key));
+            report(String.format("connection lost between Kafka commit and database mark: %,d events, batch 500: the"
+                    + " relay marked the batch it remembered once connected again, %,d records, 0 repeats, 0 lost",
+                    n, consumer.seen.size()));
+        }
+    }
+
+    @Test
+    void aDeathBetweenTheKafkaCommitAndTheDatabaseMarkRepeatsThatBatchOnly() throws Exception {
+        String topic = KafkaEnv.newTopic(6);
+        int n = 5_000;
+        try (Connection c = TestDb.connect()) {
+            KafkaEnv.insert(c, topic, n, 100);
+        }
+        var real = new PgOutboxStore(TestDb.url(), TestDb.props(), "window");
+        OutboxStore dying = dyingAtTheThirdMark(real);
+        try (var publisher = new KafkaPublisher(KafkaEnv.bootstrap(), "window", Map.of());
+             KafkaEnv.Consumer consumer = new KafkaEnv.Consumer(topic)) {
+            var relay = new Relay(dying, publisher, Relay.Settings.defaults().withBatchSize(500));
+            while (relay.step() != Relay.Step.RETRY) {
+                // until the third batch is in Kafka and its mark has failed: here the process dies
+            }
+            var next = new Relay(real, publisher, Relay.Settings.defaults().withBatchSize(500));
+            while (next.step() != Relay.Step.IDLE) {
+                // the relay that starts next drains the rest
+            }
+            real.close();
             assertTrue(consumer.pollUntil(x -> x.seen.size() >= n + 500, Duration.ofSeconds(30)));
             consumer.pollUntil(x -> false, Duration.ofSeconds(1));
             assertEquals(n + 500, consumer.seen.size()); // the third batch, twice; nothing else

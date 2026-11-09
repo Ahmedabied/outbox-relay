@@ -42,11 +42,12 @@ names of earlier versions, so an existing install carries on as it is.
 | Order per key | Rows go out in id order, and each batch is **one Kafka transaction** with an idempotent producer (`acks=all`). A failed batch is aborted, so `read_committed` consumers never see half of it and a retry cannot reorder. |
 | One relay at a time | The relay holds a Postgres session advisory lock on its own connection. If that connection dies, the lock goes with it and a standby takes over. The Kafka `transactional.id` is a second fence: a relay that still thinks it leads is refused by Kafka. |
 | A bad row is not skipped | A row Kafka refuses for good (too large, say) is narrowed down, everything before it goes out, then the relay stops and names the row. Skipping it would deliver later events for the same key without it. |
-| Outages are waited out | Broker or network trouble is retried with backoff, forever, and the database connection is rebuilt. |
+| Outages are waited out | Broker or network trouble is retried with backoff, forever, and the database connection is rebuilt. A batch Kafka already has when the database goes is kept in memory and marked first once the database is back, so a lost connection repeats nothing. If marking keeps failing (a permission, say), the relay keeps retrying it and publishes nothing new, rather than sending the same batch again and again; `oldest_unsent_age_seconds` grows, so the OutboxStuck alert fires. |
 | Low lag without polling hard | A statement trigger sends `NOTIFY` on insert, delivered at commit; the relay wakes at once and only polls once a second as a safety net. |
 
-The one thing it cannot do is exactly once: if the relay dies after Kafka commits and before the database marks the
-rows, that batch is published again. Every record carries an `outbox-id` header, and a consumer that writes to
+The one thing it cannot do is exactly once: if the relay process dies after Kafka commits and before the database
+marks the rows, that batch is published again by the relay that comes next. A row is marked by its id and creation
+time, so a batch kept in memory can never mark a different row that reused the id. Every record carries an `outbox-id` header, and a consumer that writes to
 Postgres can use `Inbox` to handle each event once: it records the id in the same transaction as the consumer's own
 write, so a repeat is skipped and a rolled-back write frees the id again.
 
@@ -113,28 +114,30 @@ Postgres 14 and 18, every number from the integration tests in `KafkaRelayIT`:
 | A backlog of 50,000 events, 100 keys, 6 partitions, batch 500 | 32,000 to 53,000 events/s (median about 34,800), 100 Kafka transactions |
 | Steady traffic, 1,000 events/s, one app transaction per event | insert to consumer p50 3.6 to 13.6 ms; p99 57 to 102 ms in 7 of 8 measurements, 461 ms once |
 | Relay JVM killed with SIGKILL 5 times mid-stream (12,000 to 36,000 rows unsent at each kill), restarted each time | 0 lost, order per key kept, 0 or 200 repeats (up to 0.5%) |
-| Database connection lost right after a Kafka commit, before the mark | that batch arrives twice (500 repeats), nothing else; 0 lost; a consumer using `Inbox` handles each of the 5,000 events once |
+| Database connection lost right after a Kafka commit, before the mark | 0 repeats, 0 lost: the same relay connects again and marks the batch it kept |
+| Relay process dead right after a Kafka commit, before the mark; the next relay takes over | that batch arrives twice (500 repeats), nothing else; 0 lost; a consumer using `Inbox` handles each of the 5,000 events once |
 
 The steady tail is the Kafka commit itself (the relay's own insert to commit p99 is 61 to 99 ms); a consumer with
-`fetch.max.wait.ms=50` measured the same. The SIGKILL test mostly lands between batches; the second test forces the
-one window where a repeat can happen, so the dedupe is shown, not assumed.
+`fetch.max.wait.ms=50` measured the same. The SIGKILL test mostly lands between batches; the last two tests force the
+one window where a repeat can happen, so both the kept batch and the dedupe are shown, not assumed.
 
 ## Tests
 
 ```bash
-mvn -B verify      # 38 tests: unit, then Postgres and Kafka integration tests in containers
+mvn -B verify      # 42 tests: unit, then Postgres and Kafka integration tests in containers
 ```
 
-- **Unit** (17, in-memory Postgres and Kafka stand-ins): order, retries, the bad-row search, a crash between Kafka
-  and the database, leader handover, fencing, the reserved `outbox-id` header, the metrics endpoint over real HTTP,
+- **Unit** (19, in-memory Postgres and Kafka stand-ins): order, retries, the bad-row search, a lost connection and a
+  dead process between Kafka and the database, a mark that keeps failing, leader handover, fencing, the reserved `outbox-id` header, the metrics endpoint over real HTTP,
   table names (what is refused, and that the default keeps the old object names).
-- **Postgres** (15, `OUTBOX_TEST_DB_URL` or a container): the real queries, the advisory lock, `NOTIFY` wake-up, a
-  late commit with a lower id, headers the schema refuses (and an old row that breaks the check can still be marked
-  sent), a second table in its own schema (its own rows, lead and wake-ups), and the inbox (once per consumer, a rollback frees the
+- **Postgres** (16, `OUTBOX_TEST_DB_URL` or a container): the real queries, the advisory lock, `NOTIFY` wake-up, a
+  late commit with a lower id, only the very rows published get marked (not a reused id), headers the schema refuses
+  (and an old row that breaks the check can still be marked sent), a second table in its own schema (its own rows, lead and wake-ups), and the inbox (once per consumer, a rollback frees the
   id, two instances racing for one id get one yes).
-- **Kafka 4.4 + Postgres** (6, containers, skipped without Docker): the backlog, steady traffic, a 2 MB row the
+- **Kafka 4.4 + Postgres** (7, containers, skipped without Docker): the backlog, steady traffic, a 2 MB row the
   producer refuses, fencing between two publishers, the SIGKILL test (the relay runs as its own JVM from the built
-  jar) and the forced repeat, run through `Inbox`.
+  jar), a lost connection after a Kafka commit (no repeat) and a death there (one batch repeated, run through
+  `Inbox`).
 
 CI runs everything on Postgres 14 and 18, then the Python consumer demo against the built relay, Kafka 4.4 and
 Postgres 18.

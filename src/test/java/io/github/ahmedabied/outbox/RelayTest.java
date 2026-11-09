@@ -76,17 +76,45 @@ class RelayTest {
     }
 
     @Test
-    void aCrashBetweenKafkaAndTheMarkRepeatsTheBatchButLosesNothing() throws Exception {
+    void aLostConnectionBetweenKafkaAndTheMarkRepeatsNothing() throws Exception {
         var db = new Fakes.Db().insert(1_000, 7);
         var kafka = new Fakes.Kafka();
         var store = new Fakes.Store(db);
-        store.failMarks = 1; // Kafka has batch 2, the database never hears of it
+        store.failMarks = 1; // Kafka has the first batch, then the database connection goes
         var relay = new Relay(store, kafka, fast(300));
         drain(relay);
-        List<Long> seen = ids(kafka.visible);
-        assertEquals(1_300, seen.size()); // one batch twice
-        assertEquals(range(1, 1_000), new ArrayList<>(new LinkedHashSet<>(seen))); // dropping repeats by id: in order
+        assertEquals(range(1, 1_000), ids(kafka.visible)); // the relay remembered the batch and marked it: no repeat
         assertEquals(1, relay.stats().databaseErrors.sum());
+        assertEquals(1_000, relay.stats().published.sum());
+    }
+
+    @Test
+    void aProcessThatDiesBetweenKafkaAndTheMarkRepeatsThatBatchOnly() throws Exception {
+        var db = new Fakes.Db().insert(1_000, 7);
+        var kafka = new Fakes.Kafka();
+        var dying = new Fakes.Store(db);
+        dying.failMarks = 1;
+        var first = new Relay(dying, kafka, fast(300));
+        while (first.step() != Relay.Step.RETRY) {
+            // until the first batch is in Kafka and the mark has failed; then this process is gone
+        }
+        var next = new Relay(new Fakes.Store(db), kafka, fast(300));
+        drain(next);
+        List<Long> seen = ids(kafka.visible);
+        assertEquals(1_300, seen.size()); // that batch twice
+        assertEquals(range(1, 1_000), new ArrayList<>(new LinkedHashSet<>(seen))); // dropping repeats by id: in order
+    }
+
+    @Test
+    void aMarkThatKeepsFailingIsRetriedWithoutPublishingAgain() throws Exception {
+        var db = new Fakes.Db().insert(1_000, 7);
+        var kafka = new Fakes.Kafka();
+        var store = new Fakes.Store(db);
+        store.failMarks = 4;
+        var relay = new Relay(store, kafka, fast(300));
+        drain(relay);
+        assertEquals(range(1, 1_000), ids(kafka.visible)); // four failed marks, still one copy of each row
+        assertEquals(4, relay.stats().databaseErrors.sum());
     }
 
     @Test
