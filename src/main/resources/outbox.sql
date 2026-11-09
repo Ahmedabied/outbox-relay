@@ -7,19 +7,25 @@ create table if not exists {table} (
     topic      text        not null,
     msg_key    text,
     payload    bytea       not null,
-    headers    jsonb       not null default '{}'
-               constraint {check}
-               check (jsonb_typeof(headers) = 'object' and not headers ? 'outbox-id'),
+    headers    jsonb       not null default '{}',
     created_at timestamptz not null default clock_timestamp(),
-    sent_at    timestamptz
+    sent_at    timestamptz,
+    -- Headers the relay could not send as they are. Unsent rows only, so a row that breaks it can still be marked
+    -- sent (the relay reads its headers as none).
+    constraint {check}
+        check (sent_at is not null or (jsonb_typeof(headers) = 'object' and not headers ? 'outbox-id'))
 );
 
--- Tables made by an older version get the header check too (new rows only; old rows are not scanned).
+-- A table made by an older version gets the check, or has its first form replaced: that one held for marking a row
+-- sent too, so one old row with bad headers was published again and again. Old rows are not scanned (not valid).
 do $$
 begin
-    if not exists (select 1 from pg_constraint where conname = {check_literal} and conrelid = {table_literal}::regclass) then
+    if not exists (select 1 from pg_constraint
+                    where conname = {check_literal} and conrelid = {table_literal}::regclass
+                      and pg_get_constraintdef(oid) like '%sent_at IS NOT NULL%') then
+        alter table {table} drop constraint if exists {check};
         alter table {table} add constraint {check}
-            check (jsonb_typeof(headers) = 'object' and not headers ? 'outbox-id') not valid;
+            check (sent_at is not null or (jsonb_typeof(headers) = 'object' and not headers ? 'outbox-id')) not valid;
     end if;
 end
 $$;

@@ -36,3 +36,49 @@ jobs:
       - name: Relay output from the crash test
         if: failure()
         run: tail -n 100 target/crash-relay.log || true
+
+  python-consumer:
+    # The Python consumer example end to end: the built relay between a real Postgres and Kafka, a consumer that
+    # crashes between its Postgres commit and its offset commit, and the sums checked against the outbox.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_PASSWORD: demo
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      OUTBOX_DB_URL: jdbc:postgresql://localhost:5432/postgres
+      OUTBOX_DB_USER: postgres
+      OUTBOX_DB_PASSWORD: demo
+      KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+      OUTBOX_STATS_SECONDS: "0"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Kafka 4.4, single node (the image's own defaults)
+        run: |
+          docker run -d --name kafka -p 9092:9092 apache/kafka:4.4.0
+          for i in $(seq 1 60); do docker logs kafka 2>&1 | grep -q "Kafka Server started" && break; sleep 1; done
+          docker logs kafka 2>&1 | grep "Kafka Server started"
+      - run: mvn -B -ntp -q package -DskipTests
+      - name: Relay
+        run: |
+          java -jar target/outbox-relay.jar init
+          nohup java -jar target/outbox-relay.jar run > relay.log 2>&1 &
+      - run: python -m pip install -r examples/python-consumer/requirements.txt
+      - name: Demo (exits 1 unless the inbox consumer matches the outbox exactly and the crash caused repeats)
+        run: python examples/python-consumer/demo.py --db postgresql://postgres:demo@localhost:5432/postgres --kafka localhost:9092
+      - name: Relay output
+        if: failure()
+        run: tail -n 50 relay.log || true

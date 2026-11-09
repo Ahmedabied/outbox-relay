@@ -98,6 +98,25 @@ class PgOutboxStoreIT {
             var e = org.junit.jupiter.api.Assertions.assertThrows(java.sql.SQLException.class, () -> sql(c,
                     "insert into outbox (topic, payload, headers) values ('t', '\\x00', '[]')"));
             assertTrue(e.getMessage().contains("outbox_headers_check"), e.getMessage());
+            store.markSent(ids(rows)); // the old row can still be marked sent, or the relay would send it forever
+            assertEquals(0, store.fetchUnsent(10).size());
+        }
+    }
+
+    @Test
+    void installUpgradesTheHeaderCheckOfAnEarlierVersion() throws Exception {
+        try (Connection c = TestDb.connect(); PgOutboxStore store = store()) {
+            sql(c, "alter table outbox drop constraint outbox_headers_check");
+            sql(c, "insert into outbox (topic, payload, headers) values ('t', '\\x00', '[1, 2]')");
+            // the check as the first version wrote it, added to a table that already held such a row
+            sql(c, "alter table outbox add constraint outbox_headers_check"
+                    + " check (jsonb_typeof(headers) = 'object' and not headers ? 'outbox-id') not valid");
+            PgOutboxStore.install(c);
+            store.markSent(ids(store.fetchUnsent(10)));
+            assertEquals(0, store.fetchUnsent(10).size());
+            var e = org.junit.jupiter.api.Assertions.assertThrows(java.sql.SQLException.class, () -> sql(c,
+                    "insert into outbox (topic, payload, headers) values ('t', '\\x00', '{\"outbox-id\": \"9\"}')"));
+            assertTrue(e.getMessage().contains("outbox_headers_check"), e.getMessage()); // new rows still checked
         }
     }
 

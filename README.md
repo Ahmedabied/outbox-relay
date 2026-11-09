@@ -59,6 +59,25 @@ conn.commit();
 ```
 
 `Inbox.install(conn)` creates its table. A claim with autocommit on is refused, because it would commit on its own.
+Outbox ids are unique per outbox table, so a consumer that reads from two outboxes uses one consumer name for each
+(`billing-orders`, `billing-payments`).
+
+### The same from Python
+
+[examples/python-consumer](examples/python-consumer) is a consumer in Python (confluent-kafka, psycopg 3) that does
+the same thing per batch: one Postgres transaction claims each `outbox-id` and applies only new ones, then the Kafka
+offsets are committed. `demo.py` runs it against a live relay through a crash between those two commits, next to a
+copy without the inbox, and checks the sums (Kafka 4.4 and Postgres 18 on this desktop; CI runs the same):
+
+| 10,000 events | applied | counted twice | records/s |
+|---|---|---|---|
+| with the inbox | 10,000 | 0 (500 repeats skipped) | 14,456 |
+| without it | 10,500 | 500 | 24,300 |
+
+```bash
+pip install -r examples/python-consumer/requirements.txt
+python examples/python-consumer/demo.py --db postgresql://app@localhost/app --kafka localhost:9092   # relay running
+```
 
 ## Metrics
 
@@ -100,21 +119,22 @@ one window where a repeat can happen, so the dedupe is shown, not assumed.
 ## Tests
 
 ```bash
-mvn -B verify      # 37 tests: unit, then Postgres and Kafka integration tests in containers
+mvn -B verify      # 38 tests: unit, then Postgres and Kafka integration tests in containers
 ```
 
 - **Unit** (17, in-memory Postgres and Kafka stand-ins): order, retries, the bad-row search, a crash between Kafka
   and the database, leader handover, fencing, the reserved `outbox-id` header, the metrics endpoint over real HTTP,
   table names (what is refused, and that the default keeps the old object names).
-- **Postgres** (14, `OUTBOX_TEST_DB_URL` or a container): the real queries, the advisory lock, `NOTIFY` wake-up, a
-  late commit with a lower id, headers the schema refuses, a second table in its own schema (its own rows, lead and
-  wake-ups), and the inbox (once per consumer, a rollback frees the
+- **Postgres** (15, `OUTBOX_TEST_DB_URL` or a container): the real queries, the advisory lock, `NOTIFY` wake-up, a
+  late commit with a lower id, headers the schema refuses (and an old row that breaks the check can still be marked
+  sent), a second table in its own schema (its own rows, lead and wake-ups), and the inbox (once per consumer, a rollback frees the
   id, two instances racing for one id get one yes).
 - **Kafka 4.4 + Postgres** (6, containers, skipped without Docker): the backlog, steady traffic, a 2 MB row the
   producer refuses, fencing between two publishers, the SIGKILL test (the relay runs as its own JVM from the built
   jar) and the forced repeat, run through `Inbox`.
 
-CI runs everything on Postgres 14 and 18.
+CI runs everything on Postgres 14 and 18, then the Python consumer demo against the built relay, Kafka 4.4 and
+Postgres 18.
 
 ## Limits
 
