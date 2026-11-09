@@ -87,8 +87,9 @@ class KafkaRelayIT {
             assertEquals(n, consumer.seen.size());
             assertEquals(n, consumer.distinct()); // no repeats without a crash
             consumer.firstArrivals().forEach((key, ids) -> assertTrue(KafkaEnv.increasing(ids), key));
-            report(String.format("backlog: %,d events, 100 keys, 6 partitions, batch 500: %.1f s, %,.0f events/s"
-                    + " (insert-to-commit p50 %d ms)", n, seconds, n / seconds, r.relay.stats().lag(0.5).toMillis()));
+            report(String.format("backlog: %,d events waiting, 100 keys, 6 partitions, batch 500: all consumed in"
+                    + " %.1f s, %,.0f events/s, %,d Kafka transactions", n, seconds, n / seconds,
+                    r.relay.stats().batches.sum()));
         }
     }
 
@@ -169,22 +170,25 @@ class KafkaRelayIT {
     void killingTheRelayMidStreamLosesNothingAndKeepsOrder() throws Exception {
         String topic = KafkaEnv.newTopic(6);
         int n = 40_000;
+        long[] killAt = {4_000, 10_000, 16_000, 22_000, 28_000}; // rows marked sent in the database
+        List<Long> unsentAtKill = new ArrayList<>();
         try (Connection c = TestDb.connect()) {
             KafkaEnv.insert(c, topic, n, 100);
-        }
-        List<Long> killedAt = new ArrayList<>();
-        try (KafkaEnv.Consumer consumer = new KafkaEnv.Consumer(topic)) {
-            for (long at : new long[] {5_000, 15_000, 25_000}) {
+            for (long at : killAt) {
                 Process p = child();
-                consumer.pollUntil(x -> x.seen.size() >= at, Duration.ofSeconds(90));
+                long sent = waitForSent(c, at, Duration.ofSeconds(90));
                 p.destroyForcibly(); // SIGKILL: no shutdown hook, no goodbye to Postgres or Kafka
                 p.waitFor();
-                killedAt.add((long) consumer.seen.size());
+                unsentAtKill.add(n - sent);
+                assertTrue(sent < n, "the relay had finished before the kill, so the kill tested nothing");
             }
+        }
+        try (KafkaEnv.Consumer consumer = new KafkaEnv.Consumer(topic)) {
             Process last = child();
             try {
                 assertTrue(consumer.pollUntil(x -> x.distinct() >= n, Duration.ofSeconds(120)),
                         "only " + consumer.distinct() + " of " + n);
+                consumer.pollUntil(x -> false, Duration.ofSeconds(2)); // any late repeats
             } finally {
                 last.destroy();
                 last.waitFor();
@@ -192,9 +196,26 @@ class KafkaRelayIT {
             assertEquals(n, consumer.distinct()); // nothing lost
             consumer.firstArrivals().forEach((key, ids) -> assertTrue(KafkaEnv.increasing(ids), key));
             long repeats = consumer.seen.size() - n;
-            report(String.format("crash: %,d events, relay killed with SIGKILL 3 times (after %s were consumed),"
-                    + " restarted each time: 0 lost, order per key kept, %,d repeats (%.2f%%), dropped by"
-                    + " outbox-id", n, killedAt, repeats, 100.0 * repeats / n));
+            report(String.format("crash: %,d events, batch 100, relay JVM killed with SIGKILL %d times mid-stream"
+                    + " (rows still unsent at each kill: %s), restarted each time: 0 lost, order per key kept,"
+                    + " %,d repeats (%.2f%%), each one dropped by its outbox-id", n, killAt.length, unsentAtKill,
+                    repeats, 100.0 * repeats / n));
+        }
+    }
+
+    private static long waitForSent(Connection c, long atLeast, Duration timeout) throws Exception {
+        long end = System.nanoTime() + timeout.toNanos();
+        try (PreparedStatement ps = c.prepareStatement("select count(*) from outbox where sent_at is not null")) {
+            while (true) {
+                try (var rs = ps.executeQuery()) {
+                    rs.next();
+                    long sent = rs.getLong(1);
+                    if (sent >= atLeast || System.nanoTime() > end) {
+                        return sent;
+                    }
+                }
+                Thread.sleep(2);
+            }
         }
     }
 
@@ -214,7 +235,7 @@ class KafkaRelayIT {
         }
         env.put("KAFKA_BOOTSTRAP_SERVERS", KafkaEnv.bootstrap());
         env.put("OUTBOX_TRANSACTIONAL_ID", "crash");
-        env.put("OUTBOX_BATCH_SIZE", "200");
+        env.put("OUTBOX_BATCH_SIZE", "100");
         env.put("OUTBOX_STATS_SECONDS", "0");
         pb.redirectErrorStream(true);
         pb.redirectOutput(ProcessBuilder.Redirect.appendTo(Path.of("target", "crash-relay.log").toFile()));
