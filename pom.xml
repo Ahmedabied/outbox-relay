@@ -60,6 +60,12 @@
       <version>${postgresql.version}</version>
     </dependency>
     <dependency>
+      <!-- kafka-clients brings an older slf4j-api that cannot find slf4j-simple 2: pin the API to match -->
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <version>${slf4j.version}</version>
+    </dependency>
+    <dependency>
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-simple</artifactId>
       <version>${slf4j.version}</version>

@@ -10,13 +10,24 @@ import java.util.logging.Logger;
 
 /** {@code java -jar outbox-relay.jar init|run}, configured by environment variables. */
 public final class Main {
+    static {
+        // One line per message: time, level, text.
+        if (System.getProperty("java.util.logging.SimpleFormatter.format") == null) {
+            System.setProperty("java.util.logging.SimpleFormatter.format", "%1$tF %1$tT %4$s %5$s%6$s%n");
+        }
+        // Kafka's client prints its whole config at INFO on every connect; its warnings are what matter here.
+        if (System.getProperty("org.slf4j.simpleLogger.log.org.apache.kafka") == null) {
+            System.setProperty("org.slf4j.simpleLogger.log.org.apache.kafka", "warn");
+        }
+    }
+
     private static final Logger LOG = Logger.getLogger(Main.class.getName());
 
     private static final String USAGE = """
             usage: java -jar outbox-relay.jar init | run
 
               init   create the outbox table, its index and the notify trigger (safe to run again)
-              run    relay until stopped; SIGTERM finishes the batch in hand first
+              run    relay until stopped; SIGTERM lets the batch in hand finish (5 s at most)
 
             environment:
               OUTBOX_DB_URL            jdbc:postgresql://host:5432/db           (required)
@@ -59,8 +70,11 @@ public final class Main {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             relay.stop();
             try {
-                if (!done.await(20, java.util.concurrent.TimeUnit.SECONDS)) {
+                // A batch takes milliseconds. Longer means waiting on a broker that is not there: interrupt.
+                // Cut short mid-commit, a batch is at worst published again, never lost.
+                if (!done.await(5, java.util.concurrent.TimeUnit.SECONDS)) {
                     worker.interrupt();
+                    done.await(5, java.util.concurrent.TimeUnit.SECONDS);
                 }
             } catch (InterruptedException ignored) {
                 Thread.currentThread().interrupt();
@@ -86,6 +100,8 @@ public final class Main {
         } catch (RelayStoppedException e) {
             LOG.severe(e.getMessage());
             exit = 1;
+        } catch (InterruptedException e) {
+            LOG.warning("stopped while waiting on Kafka or the database; the batch in hand will be published again");
         } finally {
             publisher.close();
             store.close();

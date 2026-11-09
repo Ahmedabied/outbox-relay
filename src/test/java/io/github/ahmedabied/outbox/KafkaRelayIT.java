@@ -95,8 +95,8 @@ class KafkaRelayIT {
 
     @Test
     void steadyTrafficLag() throws Exception {
+        // Measured once with fetch.max.wait.ms=50 as well: no change. The tail is the Kafka commit, not the consumer.
         steady("consumer defaults", Map.of());
-        steady("consumer fetch.max.wait.ms=50", Map.of("fetch.max.wait.ms", 50));
     }
 
     private void steady(String label, Map<String, Object> consumerSettings) throws Exception {

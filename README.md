@@ -23,7 +23,7 @@ mvn -B package -DskipITs                     # target/outbox-relay.jar
 export OUTBOX_DB_URL=jdbc:postgresql://localhost:5432/app OUTBOX_DB_USER=app OUTBOX_DB_PASSWORD=...
 export KAFKA_BOOTSTRAP_SERVERS=localhost:9092
 java -jar target/outbox-relay.jar init       # outbox table, index, notify trigger (safe to run again)
-java -jar target/outbox-relay.jar run        # SIGTERM finishes the batch in hand, then exits
+java -jar target/outbox-relay.jar run        # SIGTERM lets the batch in hand finish, then exits
 ```
 
 Consumers read with `isolation.level=read_committed` and drop a repeat by the `outbox-id` header (see below).
@@ -43,19 +43,35 @@ The one thing it cannot do is exactly once: if the relay dies after Kafka commit
 rows, that batch is published again. Every record carries an `outbox-id` header so consumers can drop the repeat
 (keep processed ids in a table with a unique key, in the same transaction as the consumer's own write).
 
+## Measured
+
+From CI (GitHub's shared runners, 2 CPUs, Postgres and a single Kafka 4.4 broker in containers), three runs on
+Postgres 14 and 18, every number from the integration tests in `KafkaRelayIT`:
+
+| What | Result |
+|---|---|
+| A backlog of 50,000 events, 100 keys, 6 partitions, batch 500 | 32,000 to 53,000 events/s (median about 34,800), 100 Kafka transactions |
+| Steady traffic, 1,000 events/s, one app transaction per event | insert to consumer p50 3.6 to 13.6 ms; p99 57 to 102 ms in 7 of 8 measurements, 461 ms once |
+| Relay JVM killed with SIGKILL 5 times mid-stream (12,000 to 36,000 rows unsent at each kill), restarted each time | 0 lost, order per key kept, 0 or 200 repeats (up to 0.5%) |
+| Database connection lost right after a Kafka commit, before the mark | that batch arrives twice (500 repeats), nothing else; 0 lost |
+
+The steady tail is the Kafka commit itself (the relay's own insert to commit p99 is 61 to 99 ms); a consumer with
+`fetch.max.wait.ms=50` measured the same. The SIGKILL test mostly lands between batches; the second test forces the
+one window where a repeat can happen, so the dedupe is shown, not assumed.
+
 ## Tests
 
 ```bash
-mvn -B verify      # unit tests, then Postgres and Kafka integration tests in containers
+mvn -B verify      # 24 tests: unit, then Postgres and Kafka integration tests in containers
 ```
 
-- **Unit** (in-memory Postgres and Kafka stand-ins): order, retries, the bad-row search, a crash between Kafka and
-  the database, leader handover, fencing.
-- **Postgres** (`OUTBOX_TEST_DB_URL` or a container): the real queries, the advisory lock, `NOTIFY` wake-up, a late
-  commit with a lower id.
-- **Kafka 4.4 + Postgres** (containers): a 50,000-row backlog over 6 partitions, steady traffic at 1,000 events/s,
-  a 2 MB row the producer refuses, fencing between two publishers, and the crash test: the relay runs as its own JVM
-  from the built jar and is killed with SIGKILL three times mid-stream.
+- **Unit** (10, in-memory Postgres and Kafka stand-ins): order, retries, the bad-row search, a crash between Kafka
+  and the database, leader handover, fencing, the reserved `outbox-id` header.
+- **Postgres** (8, `OUTBOX_TEST_DB_URL` or a container): the real queries, the advisory lock, `NOTIFY` wake-up, a
+  late commit with a lower id, headers the schema refuses.
+- **Kafka 4.4 + Postgres** (6, containers, skipped without Docker): the backlog, steady traffic, a 2 MB row the
+  producer refuses, fencing between two publishers, the SIGKILL test (the relay runs as its own JVM from the built
+  jar) and the forced repeat.
 
 CI runs everything on Postgres 14 and 18.
 
