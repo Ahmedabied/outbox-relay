@@ -28,6 +28,12 @@ java -jar target/outbox-relay.jar run        # SIGTERM lets the batch in hand fi
 
 Consumers read with `isolation.level=read_committed` and drop a repeat by its `outbox-id` header (`Inbox`, below).
 
+Another table name, or a table in its own schema: set `OUTBOX_TABLE=app.orders_outbox` for both `init` and `run`.
+Its index, header check, trigger, notify channel and lead get names of their own, so several outboxes in one
+database each have a relay that only wakes for its own inserts. Names are lower case letters, digits and `_`, and
+are quoted in every statement; anything else is refused before it reaches SQL. The default `outbox` keeps the object
+names of earlier versions, so an existing install carries on as it is.
+
 ## How it keeps its promises
 
 | Promise | How |
@@ -94,13 +100,15 @@ one window where a repeat can happen, so the dedupe is shown, not assumed.
 ## Tests
 
 ```bash
-mvn -B verify      # 32 tests: unit, then Postgres and Kafka integration tests in containers
+mvn -B verify      # 37 tests: unit, then Postgres and Kafka integration tests in containers
 ```
 
-- **Unit** (13, in-memory Postgres and Kafka stand-ins): order, retries, the bad-row search, a crash between Kafka
-  and the database, leader handover, fencing, the reserved `outbox-id` header, the metrics endpoint over real HTTP.
-- **Postgres** (13, `OUTBOX_TEST_DB_URL` or a container): the real queries, the advisory lock, `NOTIFY` wake-up, a
-  late commit with a lower id, headers the schema refuses, and the inbox (once per consumer, a rollback frees the
+- **Unit** (17, in-memory Postgres and Kafka stand-ins): order, retries, the bad-row search, a crash between Kafka
+  and the database, leader handover, fencing, the reserved `outbox-id` header, the metrics endpoint over real HTTP,
+  table names (what is refused, and that the default keeps the old object names).
+- **Postgres** (14, `OUTBOX_TEST_DB_URL` or a container): the real queries, the advisory lock, `NOTIFY` wake-up, a
+  late commit with a lower id, headers the schema refuses, a second table in its own schema (its own rows, lead and
+  wake-ups), and the inbox (once per consumer, a rollback frees the
   id, two instances racing for one id get one yes).
 - **Kafka 4.4 + Postgres** (6, containers, skipped without Docker): the backlog, steady traffic, a 2 MB row the
   producer refuses, fencing between two publishers, the SIGKILL test (the relay runs as its own JVM from the built
@@ -115,7 +123,7 @@ CI runs everything on Postgres 14 and 18.
 - Consumers that read with `read_uncommitted` (the Kafka default) can see aborted batches. Use `read_committed`.
 - Sent rows stay in the table with `sent_at` set, and inbox rows stay too. Delete old ones on a schedule:
   `delete from outbox where sent_at < now() - interval '7 days'`; keep inbox rows longer than a relay could be down.
-- The table name is fixed (`outbox`) and the relay works one table per process.
+- One table per relay process: several outboxes need one relay each, with its own `OUTBOX_TABLE`.
 - Lag numbers depend on the machine; the ones here come from GitHub's shared CI runners.
 
 Built with AI pair programming.

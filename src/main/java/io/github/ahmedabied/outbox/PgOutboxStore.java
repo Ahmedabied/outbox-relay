@@ -32,7 +32,7 @@ public final class PgOutboxStore implements OutboxStore {
                    case when o.headers = '{}' or jsonb_typeof(o.headers) <> 'object' then null
                         else (select array_agg(e.value order by e.key)
                                 from jsonb_each_text(jsonb_strip_nulls(o.headers)) e) end
-              from outbox o
+              from {table} o
              where o.sent_at is null
              order by o.id
              limit ?""";
@@ -40,28 +40,44 @@ public final class PgOutboxStore implements OutboxStore {
     private final String url;
     private final Properties props;
     private final String lockName;
+    private final OutboxTable table;
+    private final String fetch;
+    private final String mark;
     private Connection conn;
+
+    /** The default table, {@code outbox}. */
+    public PgOutboxStore(String url, Properties props, String lockName) {
+        this(url, props, lockName, OutboxTable.DEFAULT);
+    }
 
     /**
      * @param lockName relays that share it share one lead; use one name per outbox table
      */
-    public PgOutboxStore(String url, Properties props, String lockName) {
+    public PgOutboxStore(String url, Properties props, String lockName, OutboxTable table) {
         this.url = url;
         this.props = new Properties();
         this.props.putAll(props);
         this.props.putIfAbsent("tcpKeepAlive", "true");
         this.props.putIfAbsent("ApplicationName", "outbox-relay");
         this.lockName = lockName;
+        this.table = table;
+        this.fetch = table.fill(FETCH);
+        this.mark = table.fill("update {table} set sent_at = clock_timestamp() where id = any(?)");
     }
 
-    /** Create the outbox table, its index and the notify trigger. Safe to run again. */
+    /** Create the default outbox table, its index and the notify trigger. Safe to run again. */
     public static void install(Connection conn) throws SQLException, IOException {
+        install(conn, OutboxTable.DEFAULT);
+    }
+
+    /** Create this outbox table, its index and the notify trigger. Safe to run again. */
+    public static void install(Connection conn, OutboxTable table) throws SQLException, IOException {
         try (InputStream in = PgOutboxStore.class.getResourceAsStream("/outbox.sql");
              Statement st = conn.createStatement()) {
             if (in == null) {
                 throw new IOException("outbox.sql is missing from the jar");
             }
-            st.execute(new String(in.readAllBytes(), StandardCharsets.UTF_8));
+            st.execute(table.fill(new String(in.readAllBytes(), StandardCharsets.UTF_8)));
         }
     }
 
@@ -71,7 +87,8 @@ public final class PgOutboxStore implements OutboxStore {
             try {
                 c.setAutoCommit(true);
                 try (Statement st = c.createStatement()) {
-                    st.execute("listen outbox_relay"); // before the first fetch, so no insert is missed
+                    // before the first fetch, so no insert is missed
+                    st.execute("listen " + OutboxTable.quote(table.channel()));
                 }
             } catch (SQLException e) {
                 c.close();
@@ -96,7 +113,7 @@ public final class PgOutboxStore implements OutboxStore {
     @Override
     public List<OutboxRow> fetchUnsent(int limit) throws SQLException {
         List<OutboxRow> rows = new ArrayList<>(Math.min(limit, 10_000));
-        try (PreparedStatement ps = conn().prepareStatement(FETCH)) {
+        try (PreparedStatement ps = conn().prepareStatement(fetch)) {
             ps.setInt(1, limit);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
@@ -126,8 +143,7 @@ public final class PgOutboxStore implements OutboxStore {
 
     @Override
     public void markSent(List<Long> ids) throws SQLException {
-        try (PreparedStatement ps = conn().prepareStatement(
-                "update outbox set sent_at = clock_timestamp() where id = any(?)")) {
+        try (PreparedStatement ps = conn().prepareStatement(mark)) {
             ps.setArray(1, conn().createArrayOf("bigint", ids.toArray()));
             ps.executeUpdate();
         }

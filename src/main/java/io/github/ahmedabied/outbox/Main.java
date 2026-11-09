@@ -33,7 +33,8 @@ public final class Main {
               OUTBOX_DB_URL            jdbc:postgresql://host:5432/db           (required)
               OUTBOX_DB_USER, OUTBOX_DB_PASSWORD
               KAFKA_BOOTSTRAP_SERVERS  host:9092                                (run)
-              OUTBOX_TRANSACTIONAL_ID  default outbox-relay; one per outbox table
+              OUTBOX_TABLE             default outbox; another name, or schema.name (one relay per table)
+              OUTBOX_TRANSACTIONAL_ID  default outbox-relay (outbox-relay:<table> for another table)
               OUTBOX_BATCH_SIZE        default 500
               OUTBOX_STATS_SECONDS     print counters and lag this often, default 30 (0: never)
               OUTBOX_METRICS_ADDR      serve Prometheus metrics at /metrics: PORT (127.0.0.1) or HOST:PORT; off if unset
@@ -51,19 +52,27 @@ public final class Main {
         Properties db = new Properties();
         put(db, "user", System.getenv("OUTBOX_DB_USER"));
         put(db, "password", System.getenv("OUTBOX_DB_PASSWORD"));
-        if (args[0].equals("init")) {
-            try (Connection c = DriverManager.getConnection(url, db)) {
-                PgOutboxStore.install(c);
-            }
-            System.err.println("outbox table ready");
+        OutboxTable table;
+        try {
+            table = OutboxTable.parse(env("OUTBOX_TABLE", "outbox"));
+        } catch (IllegalArgumentException e) {
+            System.err.println(e.getMessage());
+            System.exit(2);
             return;
         }
-        String txId = env("OUTBOX_TRANSACTIONAL_ID", "outbox-relay");
+        if (args[0].equals("init")) {
+            try (Connection c = DriverManager.getConnection(url, db)) {
+                PgOutboxStore.install(c, table);
+            }
+            System.err.println("outbox table " + table + " ready");
+            return;
+        }
+        String txId = env("OUTBOX_TRANSACTIONAL_ID", table.defaultTransactionalId());
         Relay.Settings settings = Relay.Settings.defaults()
                 .withBatchSize(Integer.parseInt(env("OUTBOX_BATCH_SIZE", "500")));
         long statsEvery = Long.parseLong(env("OUTBOX_STATS_SECONDS", "30"));
 
-        PgOutboxStore store = new PgOutboxStore(url, db, txId);
+        PgOutboxStore store = new PgOutboxStore(url, db, txId, table);
         KafkaPublisher publisher = new KafkaPublisher(need("KAFKA_BOOTSTRAP_SERVERS"), txId, Map.of());
         Relay relay = new Relay(store, publisher, settings);
         String metricsAddr = env("OUTBOX_METRICS_ADDR", "");

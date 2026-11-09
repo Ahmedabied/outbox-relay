@@ -1,13 +1,14 @@
 -- outbox-relay schema. Safe to run again.
--- The app inserts into outbox in the same transaction as its own data; the relay does the rest.
+-- The app inserts into the outbox table in the same transaction as its own data; the relay does the rest.
+-- {table} and the other names in braces are filled in from OUTBOX_TABLE (default outbox), already quoted.
 
-create table if not exists outbox (
+create table if not exists {table} (
     id         bigint generated always as identity primary key,
     topic      text        not null,
     msg_key    text,
     payload    bytea       not null,
     headers    jsonb       not null default '{}'
-               constraint outbox_headers_check
+               constraint {check}
                check (jsonb_typeof(headers) = 'object' and not headers ? 'outbox-id'),
     created_at timestamptz not null default clock_timestamp(),
     sent_at    timestamptz
@@ -16,23 +17,23 @@ create table if not exists outbox (
 -- Tables made by an older version get the header check too (new rows only; old rows are not scanned).
 do $$
 begin
-    if not exists (select 1 from pg_constraint where conname = 'outbox_headers_check') then
-        alter table outbox add constraint outbox_headers_check
+    if not exists (select 1 from pg_constraint where conname = {check_literal} and conrelid = {table_literal}::regclass) then
+        alter table {table} add constraint {check}
             check (jsonb_typeof(headers) = 'object' and not headers ? 'outbox-id') not valid;
     end if;
 end
 $$;
 
 -- The relay reads only unsent rows, in id order: this index stays as small as the backlog.
-create index if not exists outbox_unsent on outbox (id) where sent_at is null;
+create index if not exists {index} on {table} (id) where sent_at is null;
 
 -- One notification per inserting statement, delivered at commit, wakes the relay at once.
-create or replace function outbox_notify() returns trigger language plpgsql as $$
+create or replace function {function}() returns trigger language plpgsql as $$
 begin
-    perform pg_notify('outbox_relay', '');
+    perform pg_notify({channel_literal}, '');
     return null;
 end
 $$;
 
-drop trigger if exists outbox_notify on outbox;
-create trigger outbox_notify after insert on outbox for each statement execute function outbox_notify();
+drop trigger if exists {trigger} on {table};
+create trigger {trigger} after insert on {table} for each statement execute function {function}();

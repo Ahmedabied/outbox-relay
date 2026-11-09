@@ -141,6 +141,49 @@ class PgOutboxStoreIT {
     }
 
     @Test
+    void anotherTableInItsOwnSchemaHasItsOwnRowsLeadAndWakeUps() throws Exception {
+        OutboxTable orders = OutboxTable.parse("app.orders_outbox");
+        try (Connection c = TestDb.connect()) {
+            sql(c, "drop schema if exists app cascade");
+            sql(c, "create schema app");
+            try {
+                PgOutboxStore.install(c, orders);
+                PgOutboxStore.install(c, orders); // safe to run again
+                try (PgOutboxStore plain = store();
+                     PgOutboxStore other = new PgOutboxStore(TestDb.url(), TestDb.props(),
+                             orders.defaultTransactionalId(), orders)) {
+                    plain.fetchUnsent(1); // both connect and listen
+                    other.fetchUnsent(1);
+                    sql(c, "insert into app.orders_outbox (topic, payload) values ('orders', '\\x01')");
+                    long t0 = System.nanoTime();
+                    other.awaitWork(Duration.ofSeconds(10));
+                    long woke = (System.nanoTime() - t0) / 1_000_000;
+                    assertTrue(woke < 2_000, "the orders relay woke after " + woke + " ms");
+                    t0 = System.nanoTime();
+                    plain.awaitWork(Duration.ofMillis(300));
+                    long idle = (System.nanoTime() - t0) / 1_000_000;
+                    assertTrue(idle >= 250, "the default relay was woken by the other table (" + idle + " ms)");
+
+                    assertTrue(plain.tryLead());
+                    assertTrue(other.tryLead()); // a lead of its own, not the default table's
+                    insert(c, 2);
+                    assertEquals(List.of(1L, 2L), ids(plain.fetchUnsent(10)));
+                    List<OutboxRow> mine = other.fetchUnsent(10);
+                    assertEquals(List.of(1L), ids(mine)); // its own ids
+                    other.markSent(ids(mine));
+                    assertEquals(2, plain.fetchUnsent(10).size()); // marking one table leaves the other alone
+                    assertEquals(0, other.fetchUnsent(10).size());
+                    var e = org.junit.jupiter.api.Assertions.assertThrows(java.sql.SQLException.class, () -> sql(c,
+                            "insert into app.orders_outbox (topic, payload, headers) values ('t', '\\x00', '[]')"));
+                    assertTrue(e.getMessage().contains("orders_outbox_headers_check"), e.getMessage());
+                }
+            } finally {
+                sql(c, "drop schema app cascade");
+            }
+        }
+    }
+
+    @Test
     void aRowThatCommitsLateWithALowerIdIsNotSkipped() throws Exception {
         try (Connection slow = TestDb.connect(); Connection fast = TestDb.connect(); PgOutboxStore store = store()) {
             slow.setAutoCommit(false);
