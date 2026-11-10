@@ -27,6 +27,24 @@ class InboxIT {
     }
 
     @Test
+    void installAgainTakesNoLockSoABusyInboxIsNotStalled() throws Exception {
+        try (Connection app = TestDb.connect(); Connection c = TestDb.connect(); Statement st = c.createStatement()) {
+            app.setAutoCommit(false);
+            assertTrue(Inbox.claim(app, "billing", 1)); // a consumer mid-transaction holds the table for writing
+            st.execute("set lock_timeout = '1s'"); // a lock the open transaction blocks would fail here, not hang
+            c.setAutoCommit(false);
+            Inbox.install(c);
+            try (var rs = st.executeQuery("select count(*) from pg_locks where pid = pg_backend_pid()"
+                    + " and relation = 'outbox_inbox'::regclass")) {
+                rs.next();
+                assertEquals(0, rs.getInt(1), "running inbox.sql again took a lock on the table");
+            }
+            c.rollback();
+            app.rollback();
+        }
+    }
+
+    @Test
     void anIdIsHandledOncePerConsumer() throws Exception {
         try (Connection c = TestDb.connect()) {
             c.setAutoCommit(false);
