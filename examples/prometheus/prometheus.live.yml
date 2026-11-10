@@ -1,0 +1,10 @@
+# For check_live.py: scrape one relay (OUTBOX_METRICS_ADDR=9464) every 5 s and evaluate alerts.yml as often.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+rule_files:
+  - alerts.yml
+scrape_configs:
+  - job_name: outbox-relay
+    static_configs:
+      - targets: ["127.0.0.1:9464"]

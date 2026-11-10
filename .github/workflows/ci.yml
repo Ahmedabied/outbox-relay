@@ -56,6 +56,8 @@ jobs:
       OUTBOX_DB_PASSWORD: demo
       KAFKA_BOOTSTRAP_SERVERS: localhost:9092
       OUTBOX_STATS_SECONDS: "0"
+      OUTBOX_METRICS_ADDR: "9464"
+      PROMETHEUS_VERSION: "3.16.0"
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-java@v5
@@ -71,14 +73,44 @@ jobs:
           docker run -d --name kafka -p 9092:9092 apache/kafka:4.4.0
           for i in $(seq 1 60); do docker logs kafka 2>&1 | grep -q "Kafka Server started" && break; sleep 1; done
           docker logs kafka 2>&1 | grep "Kafka Server started"
+      - name: Prometheus (release binary, checksum verified), the alert rules and their unit tests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "v$PROMETHEUS_VERSION" -R prometheus/prometheus -D /tmp/prom \
+            -p "prometheus-$PROMETHEUS_VERSION.linux-amd64.tar.gz" -p sha256sums.txt
+          cd /tmp/prom
+          grep " prometheus-$PROMETHEUS_VERSION.linux-amd64.tar.gz$" sha256sums.txt | sha256sum -c -
+          tar -xzf "prometheus-$PROMETHEUS_VERSION.linux-amd64.tar.gz" --strip-components=1
+          cd "$GITHUB_WORKSPACE/examples/prometheus"
+          /tmp/prom/promtool check rules alerts.yml
+          /tmp/prom/promtool test rules alerts.test.yml
+      - name: Prometheus scraping the relay every 5 s
+        run: |
+          nohup /tmp/prom/prometheus --config.file=examples/prometheus/prometheus.live.yml \
+            --storage.tsdb.path=/tmp/prom/data > /tmp/prom/prometheus.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://localhost:9090/-/ready > /dev/null && break; sleep 1; done
+          curl -sf http://localhost:9090/-/ready
       - run: mvn -B -ntp -q package -DskipTests
       - name: Relay
         run: |
           java -jar target/outbox-relay.jar init
           nohup java -jar target/outbox-relay.jar run > relay.log 2>&1 &
+          echo $! > relay.pid
       - run: python -m pip install -r examples/python-consumer/requirements.txt
       - name: Demo (exits 1 unless the inbox consumer matches the outbox exactly and the crash caused repeats)
         run: python examples/python-consumer/demo.py --db postgresql://postgres:demo@localhost:5432/postgres --kafka localhost:9092
-      - name: Relay output
+      - name: Alert rules on the live relay (healthy, then Kafka stopped, then the relay stopped)
+        env:
+          PG: postgresql://postgres:demo@localhost:5432/postgres
+        run: |
+          python examples/prometheus/check_live.py healthy --db "$PG"
+          docker stop kafka
+          python examples/prometheus/check_live.py kafka-down --db "$PG"
+          kill "$(cat relay.pid)"
+          python examples/prometheus/check_live.py relay-gone
+      - name: Relay and Prometheus output
         if: failure()
-        run: tail -n 50 relay.log || true
+        run: |
+          tail -n 50 relay.log || true
+          tail -n 30 /tmp/prom/prometheus.log || true

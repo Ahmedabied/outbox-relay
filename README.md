@@ -95,7 +95,11 @@ counters, never th`outbox_relay_published_total`, `batches_total`, `retries_tota
 
 Alert rules to start from: [`examples/prometheus/alerts.yml`](examples/prometheus/alerts.yml). CI runs their unit
 tests (`promtool test rules alerts.test.yml`, one case per failure below), and a Java test checks that every metric
-name in the rules is one the relay serves.
+name in the rules is one the relay serves. CI then runs the rules against a real relay that Prometheus scrapes
+([`check_live.py`](examples/prometheus/check_live.py)): quiet while healthy; with Kafka stopped, OutboxStuck went
+pending 64 s after a write, and the last read was never more than 17 s old (the producer's 15 s metadata wait, then
+a retry), so OutboxRelayStalled stayed quiet; with the relay stopped, OutboxNoLeader went pending in 11 s. Those
+numbers are from one local run (Kafka 4.4, Prometheus 3.16, 5 s scrapes).
 
 | Alert | Fires when | |
 |---|---|---|
