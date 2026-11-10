@@ -53,6 +53,13 @@ public final class MetricsServer implements AutoCloseable {
         return server.getAddress().getPort();
     }
 
+    /** Where it listens, as a URL: the bound host and port ({@code 9464} reads http://127.0.0.1:9464/metrics). */
+    public String url() {
+        InetSocketAddress a = server.getAddress();
+        String host = a.getAddress().getHostAddress();
+        return "http://" + (host.contains(":") ? "[" + host + "]" : host) + ":" + a.getPort() + "/metrics";
+    }
+
     private static void handle(HttpExchange exchange, Relay relay) throws IOException {
         try (exchange) {
             int status;

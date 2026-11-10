@@ -62,6 +62,7 @@ class MetricsServerTest {
             assertEquals(0, m.get("outbox_relay_oldest_unsent_age_seconds")); // empty at the last fetch
             assertTrue(Math.abs(m.get("outbox_relay_last_fetch_timestamp_seconds") - Instant.now().getEpochSecond()) < 60);
             assertTrue(m.containsKey("outbox_relay_lag_seconds{quantile=\"0.99\"}"));
+            assertEquals("http://127.0.0.1:" + server.port() + "/metrics", server.url());
             assertEquals(404, send(server.port(), "GET", "/").statusCode());
             assertEquals(405, send(server.port(), "POST", "/metrics").statusCode());
         }

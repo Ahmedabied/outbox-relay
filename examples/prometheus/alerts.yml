@@ -1,6 +1,8 @@
 # Alert rules for the relay's /metrics (OUTBOX_METRICS_ADDR). Tested with `promtool test rules alerts.test.yml`;
 # MetricsServerTest checks that every metric name used here is one the relay serves. Thresholds are starting
-# points. A healthy or retrying leader reads the outbox at least every 10 s (the longest backoff by default).
+# points. A healthy leader reads the outbox about every second when idle. Through a Kafka outage it reads again on
+# every retry: every 15 s at first (the producer waits 15 s for the broker), then every 25 s once the backoff
+# reaches its 10 s longest (measured over a 4 minute outage), well inside OutboxRelayStalled's 60 s.
 groups:
   - name: outbox-relay
     rules:
@@ -35,8 +37,8 @@ groups:
           summary: "No outbox relay is leading"
 
       - alert: OutboxRowRefused
-        # Kafka refused a batch and the relay narrowed it down. A row refused for good stops the relay in about a
-        # second, which a scrape rarely catches; that case shows as OutboxNoLeader.
+        # Kafka refused a batch and the relay narrowed it down. A row refused for good stops the relay within
+        # seconds (2 s with a 2 MB row), so a scrape can miss this; that case pages as OutboxNoLeader.
         expr: increase(outbox_relay_rejections_total[15m]) > 0
         labels:
           severity: ticket

@@ -79,7 +79,7 @@ public final class Main {
         String metricsAddr = env("OUTBOX_METRICS_ADDR", "");
         MetricsServer metrics = metricsAddr.isEmpty() ? null : new MetricsServer(MetricsServer.parse(metricsAddr), relay);
         if (metrics != null) {
-            LOG.info("metrics at http://" + metricsAddr + "/metrics");
+            LOG.info("metrics at " + metrics.url());
         }
         CountDownLatch done = new CountDownLatch(1);
         Thread worker = Thread.currentThread();

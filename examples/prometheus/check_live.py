@@ -10,8 +10,9 @@ does, every 5 s. Three steps, run in order, with your own way to stop Kafka and 
     python examples/prometheus/check_live.py relay-gone --prometheus http://localhost:9090
 
 healthy: 100 rows go through; all six rules evaluate without error, every metric name in them has a series,
-and no alert is pending or firing. kafka-down: one row is written and OutboxStuck must go pending. relay-gone:
-OutboxNoLeader must go pending. Pending means the expression is true; the `for:` waits are tested by promtool.
+and no alert is pending or firing. kafka-down: one row is written; OutboxStuck must go pending and
+OutboxRelayStalled must not (the relay reads on every retry). relay-gone: OutboxNoLeader must go pending.
+Pending means the expression is true; the `for:` waits are tested by promtool.
 """
 
 from __future__ import annotations
@@ -122,13 +123,16 @@ def kafka_down(a) -> list[str]:
         for name, state in on.items():
             seen.setdefault(name, round(time.monotonic() - t0))
         worst_read = max(worst_read, value(a.prometheus, "time() - max(outbox_relay_last_fetch_timestamp_seconds)") or 0)
-        return "OutboxStuck" in on
+        return "OutboxStuck" in seen and time.monotonic() - t0 >= a.watch
 
-    until("OutboxStuck goes pending with Kafka down", stuck, 240, 2)
+    until(f"OutboxStuck goes pending with Kafka down, watched for {a.watch:.0f} s", stuck, a.watch + 240, 2)
     retries = value(a.prometheus, "max(outbox_relay_retries_total)")
     print(f"Kafka down: OutboxStuck pending after {seen['OutboxStuck']} s; alerts seen (s after the insert): {seen};"
           f" longest gap between reads {worst_read:.1f} s; retries {retries:.0f}")
-    return [] if retries else ["no retries counted while Kafka was down"]
+    problems = [] if retries else ["no retries counted while Kafka was down"]
+    if "OutboxRelayStalled" in seen:  # the relay reads on every retry, so the read time must stay fresh
+        problems.append(f"OutboxRelayStalled went pending {seen['OutboxRelayStalled']} s into the outage")
+    return problems
 
 
 def relay_gone(a) -> list[str]:
@@ -144,6 +148,8 @@ def main() -> int:
     ap.add_argument("--prometheus", default="http://localhost:9090")
     ap.add_argument("--db", help="Postgres URL for psycopg (healthy and kafka-down write rows)")
     ap.add_argument("--table", default="outbox")
+    ap.add_argument("--watch", type=float, default=150,
+                    help="kafka-down: seconds to keep watching, so the relay's backoff reaches its longest")
     a = ap.parse_args()
     if a.step != "relay-gone" and not a.db:
         ap.error("--db is needed for this step")

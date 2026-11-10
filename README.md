@@ -96,10 +96,12 @@ counters, never th`outbox_relay_published_total`, `batches_total`, `retries_tota
 Alert rules to start from: [`examples/prometheus/alerts.yml`](examples/prometheus/alerts.yml). CI runs their unit
 tests (`promtool test rules alerts.test.yml`, one case per failure below), and a Java test checks that every metric
 name in the rules is one the relay serves. CI then runs the rules against a real relay that Prometheus scrapes
-([`check_live.py`](examples/prometheus/check_live.py)): quiet while healthy; with Kafka stopped, OutboxStuck went
-pending 64 s after a write, and the last read was never more than 17 s old (the producer's 15 s metadata wait, then
-a retry), so OutboxRelayStalled stayed quiet; with the relay stopped, OutboxNoLeader went pending in 11 s. Those
-numbers are from one local run (Kafka 4.4, Prometheus 3.16, 5 s scrapes).
+([`check_live.py`](examples/prometheus/check_live.py)): quiet while healthy; with Kafka stopped, OutboxStuck must go
+pending and OutboxRelayStalled must stay quiet for 150 s; with the relay stopped, OutboxNoLeader must go pending. In
+CI, OutboxStuck went pending 68 s after the write and OutboxNoLeader 14 s after the stop. Over a 4 minute outage
+(local, Kafka 4.4, 5 s scrapes) the relay read every 15 s at first (the producer waits 15 s for the broker), then
+every 25 s once its backoff reached 10 s; in two runs Prometheus never saw a read older than 29 s, against the 60 s
+of OutboxRelayStalled.
 
 | Alert | Fires when | |
 |---|---|---|
@@ -113,8 +115,10 @@ numbers are from one local run (Kafka 4.4, Prometheus 3.16, 5 s scrapes).
 The first two cover each other. While Kafka is down the relay retries and reads again each time, so the age grows
 and OutboxStuck fires. While marking a sent batch keeps failing, the relay retries the mark and reads nothing new,
 so the age stands still at its last value and only the stale read time shows it (both cases are tests in
-`MetricsServerTest`). A row Kafka refuses for good stops the relay in about a second, with exit code 1 and the row
-named in its log; every replica stops on the same row, so that pages as OutboxNoLeader.
+`MetricsServerTest`). A row Kafka refuses for good stops the relay with exit code 1 and the row named in its log
+(a 2 MB row: 2 s after the relay took the lead, having published the row before it). Every replica stops on the
+same row, so that pages as OutboxNoLeader. Under a restart policy the relay starts, is refused and exits again in a
+loop: alert on its restarts too, since a scrape that catches a start leading resets OutboxNoLeader's 2 minutes.
 
 g while Kafka is down and the relay retries.
 
