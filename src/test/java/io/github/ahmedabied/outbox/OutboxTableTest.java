@@ -25,7 +25,9 @@ class OutboxTableTest {
         String sql = t.fill(schema());
         assertFalse(java.util.regex.Pattern.compile("\\{[a-z_]+}").matcher(sql).find(), "a name left unfilled");
         assertTrue(sql.contains("perform pg_notify('outbox_relay', '');"));
-        assertTrue(sql.contains("create index if not exists \"outbox_unsent\" on \"outbox\" (id)"));
+        assertTrue(sql.contains("if to_regclass('\"outbox_unsent\"') is null then"));
+        assertTrue(sql.contains("create index \"outbox_unsent\" on \"outbox\" (id)"));
+        assertTrue(sql.contains("tgrelid = '\"outbox\"'::regclass and tgname = 'outbox_notify'"));
     }
 
     @Test
@@ -41,6 +43,8 @@ class OutboxTableTest {
         assertTrue(sql.contains("create table if not exists \"app\".\"orders_outbox\" ("));
         assertTrue(sql.contains("conrelid = '\"app\".\"orders_outbox\"'::regclass"));
         assertTrue(sql.contains("execute function \"app\".\"orders_outbox_notify\"();"));
+        assertTrue(sql.contains("if to_regclass('\"app\".\"orders_outbox_unsent\"') is null then"));
+        assertTrue(sql.contains("tgrelid = '\"app\".\"orders_outbox\"'::regclass and tgname = 'orders_outbox_notify'"));
     }
 
     @Test

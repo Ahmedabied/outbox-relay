@@ -26,6 +26,15 @@ java -jar target/outbox-relay.jar init       # outbox table, index, notify trigg
 java -jar target/outbox-relay.jar run        # SIGTERM lets the batch in hand finish, then exits
 ```
 
+`init` can run on every deploy, on a busy table too. A run that finds everything in place takes no lock on the
+table. Plain `create index if not exists` and `drop trigger if exists` do: both lock the table before they look, so
+behind one long transaction they wait, and every insert waits behind them. That was found by running the schema file
+through [pg-migration-check](https://github.com/Ahmedabied/pg-migration-check) on a table of 500,000 rows. With one
+transaction holding an uncommitted insert, the old `init` was still waiting when it was cancelled after 4 s, and a second
+insert gave up at its 2 s lock timeout; now `init` returns at once and the insert goes through. When the table does need
+a change (an upgrade from an older version), `init` waits 3 s at most for the lock, then stops with nothing changed
+and says so.
+
 Consumers read with `isolation.level=read_committed` and drop a repeat by its `outbox-id` header (`Inbox`, below).
 
 Another table name, or a table in its own schema: set `OUTBOX_TABLE=app.orders_outbox` for both `init` and `run`.
@@ -142,14 +151,15 @@ one window where a repeat can happen, so both the kept batch and the dedupe are 
 ## Tests
 
 ```bash
-mvn -B verify      # 44 tests: unit, then Postgres and Kafka integration tests in containers
+mvn -B verify      # 50 tests: unit, then Postgres and Kafka integration tests in containers
 ```
 
-- **Unit** (20, in-memory Postgres and Kafka stand-ins): order, retries, the bad-row search, a lost connection and a
+- **Unit** (23, in-memory Postgres and Kafka stand-ins): order, retries, the bad-row search, a lost connection and a
   dead process between Kafka and the database, a mark that keeps failing, trouble before the lead logged once (a
   missing table is said, not retried in silence), leader handover, fencing, the reserved `outbox-id` header, the metrics endpoint over real HTTP,
   table names (what is refused, and that the default keeps the old object names).
-- **Postgres** (17, `OUTBOX_TEST_DB_URL` or a container): the real queries, the advisory lock (one lead per table,
+- **Postgres** (20, `OUTBOX_TEST_DB_URL` or a container): the real queries, `init` run again behind an open
+  transaction (no lock, no wait), an upgrade that cannot get the table (gives up after 3 s, nothing changed), the advisory lock (one lead per table,
   however it is named, kept when the table is made again), `NOTIFY` wake-up, a
   late commit with a lower id, a batch kept across a reconnect marks only its own rows (never a reused id), headers the schema refuses
   (and an old row that breaks the check can still be marked sent), a second table in its own schema (its own rows, lead and wake-ups), and the inbox (once per consumer, a rollback frees the
@@ -171,6 +181,13 @@ Postgres 18.
   `delete from outbox where sent_at < now() - interval '7 days'`; keep inbox rows longer than a relay could be down.
 - One table per relay process: several outboxes need one relay each, with its own `OUTBOX_TABLE`.
 - Lag numbers depend on the machine; the ones here come from GitHub's shared CI runners.
+
+## Related
+
+- [pg-migration-check](https://github.com/Ahmedabied/pg-migration-check) reports the locks a schema change takes
+  and what they block. It is how the locks in `init` were found (see Run it).
+- [valuation-loop](https://github.com/Ahmedabied/valuation-loop) uses the same pattern inside a Spring Boot
+  service: the state change and its events in one transaction, a relay to Kafka.
 
 Built with AI pair programming.
 

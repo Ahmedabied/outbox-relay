@@ -94,8 +94,10 @@ public final class OutboxTable {
                 .replace("{table_literal}", literal())
                 .replace("{check}", quote(checkName()))
                 .replace("{check_literal}", "'" + checkName() + "'")
+                .replace("{index_literal}", "'" + qualified(indexName()) + "'")
                 .replace("{index}", quote(indexName()))
                 .replace("{function}", qualified(notifyName()))
+                .replace("{trigger_literal}", "'" + notifyName() + "'")
                 .replace("{trigger}", quote(notifyName()))
                 .replace("{channel_literal}", "'" + channel() + "'");
     }

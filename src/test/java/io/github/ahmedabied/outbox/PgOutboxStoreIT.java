@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.charset.StandardCharsets;
@@ -50,6 +51,63 @@ class PgOutboxStoreIT {
                 rs.next();
                 assertEquals(3, rs.getInt(1));
             }
+        }
+    }
+
+    private static int count(Connection c, String query) throws Exception {
+        try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery(query)) {
+            rs.next();
+            return rs.getInt(1);
+        }
+    }
+
+    @Test
+    void installAgainTakesNoLockSoABusyTableIsNotStalled() throws Exception {
+        try (Connection app = TestDb.connect(); Connection c = TestDb.connect(); Connection other = TestDb.connect()) {
+            app.setAutoCommit(false);
+            insert(app, 1); // one open transaction that wrote an event holds the table against schema changes
+            long start = System.nanoTime();
+            PgOutboxStore.install(c); // used to wait for that transaction, with every later insert queued behind it
+            assertTrue(System.nanoTime() - start < 2_000_000_000L, "install waited for the open transaction");
+            sql(other, "set lock_timeout = '2s'");
+            insert(other, 1); // nothing stands in the queue in front of it
+            app.rollback();
+        }
+    }
+
+    @Test
+    void anUpgradeThatCannotGetTheTableGivesUpAndChangesNothing() throws Exception {
+        String hasCheck = "select count(*) from pg_constraint where conname = 'outbox_headers_check'";
+        try (Connection app = TestDb.connect(); Connection c = TestDb.connect()) {
+            sql(c, "alter table outbox drop constraint outbox_headers_check"); // a table from before the check
+            app.setAutoCommit(false);
+            insert(app, 1);
+            long start = System.nanoTime();
+            var e = assertThrows(PgOutboxStore.TableBusyException.class, () -> PgOutboxStore.install(c));
+            long waitedMs = (System.nanoTime() - start) / 1_000_000;
+            assertTrue(waitedMs >= 2_500 && waitedMs < 10_000, "waited " + waitedMs + " ms");
+            assertTrue(e.getMessage().contains("Nothing was changed"), e.getMessage());
+            assertTrue(c.getAutoCommit(), "the connection comes back as it was given");
+            assertEquals(0, count(c, hasCheck));
+            app.commit();
+            PgOutboxStore.install(c); // the table is free now: the upgrade goes through
+            assertEquals(1, count(c, hasCheck));
+        }
+    }
+
+    @Test
+    void installInsideTheCallersTransactionCommitsOrRollsBackWithIt() throws Exception {
+        String hasTrigger = "select count(*) from pg_trigger where tgname = 'outbox_notify'";
+        try (Connection c = TestDb.connect()) {
+            sql(c, "drop trigger outbox_notify on outbox");
+            c.setAutoCommit(false);
+            PgOutboxStore.install(c);
+            assertFalse(c.getAutoCommit());
+            c.rollback(); // the caller's decision: the trigger the install made goes with it
+            assertEquals(0, count(c, hasTrigger));
+            PgOutboxStore.install(c);
+            c.commit();
+            assertEquals(1, count(c, hasTrigger));
         }
     }
 

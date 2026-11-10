@@ -88,14 +88,53 @@ public final class PgOutboxStore implements OutboxStore {
         install(conn, OutboxTable.DEFAULT);
     }
 
-    /** Create this outbox table, its index and the notify trigger. Safe to run again. */
+    /**
+     * Create this outbox table, its index and the notify trigger. Safe to run again, on a busy table too: a run that
+     * finds everything in place takes no lock on the table, and one that has to change it waits 3 s at most for the
+     * lock, then fails with {@link TableBusyException} and nothing changed.
+     *
+     * <p>An autocommit connection gets one transaction for the whole install. A connection already in a transaction
+     * keeps it: the install is part of it and commits or rolls back with it.
+     */
     public static void install(Connection conn, OutboxTable table) throws SQLException, IOException {
-        try (InputStream in = PgOutboxStore.class.getResourceAsStream("/outbox.sql");
-             Statement st = conn.createStatement()) {
+        String sql;
+        try (InputStream in = PgOutboxStore.class.getResourceAsStream("/outbox.sql")) {
             if (in == null) {
                 throw new IOException("outbox.sql is missing from the jar");
             }
-            st.execute(table.fill(new String(in.readAllBytes(), StandardCharsets.UTF_8)));
+            sql = table.fill(new String(in.readAllBytes(), StandardCharsets.UTF_8));
+        }
+        boolean own = conn.getAutoCommit();
+        if (own) {
+            conn.setAutoCommit(false);
+        }
+        try (Statement st = conn.createStatement()) {
+            st.execute(sql);
+            if (own) {
+                conn.commit();
+            }
+        } catch (SQLException e) {
+            if (own) {
+                conn.rollback();
+            }
+            throw LOCK_NOT_AVAILABLE.equals(e.getSQLState()) ? new TableBusyException(table, e) : e;
+        } finally {
+            if (own) {
+                conn.setAutoCommit(true);
+            }
+        }
+    }
+
+    private static final String LOCK_NOT_AVAILABLE = "55P03";
+
+    /** The install had to change the table and could not get its lock in time. Nothing was changed. */
+    public static final class TableBusyException extends SQLException {
+        private static final long serialVersionUID = 1L;
+
+        TableBusyException(OutboxTable table, SQLException cause) {
+            super("outbox table " + table + " needs a change and is in use: another transaction held it for more than"
+                    + " 3 s. Nothing was changed. Run init again; it gives up rather than wait, because every insert"
+                    + " would wait behind it.", cause.getSQLState(), cause);
         }
     }
 

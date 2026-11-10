@@ -26,7 +26,7 @@ public final class Main {
     private static final String USAGE = """
             usage: java -jar outbox-relay.jar init | run
 
-              init   create the outbox table, its index and the notify trigger (safe to run again)
+              init   create the outbox table, its index and the notify trigger (safe to run again, on a busy table too)
               run    relay until stopped; SIGTERM lets the batch in hand finish (5 s at most)
 
             environment:
@@ -64,6 +64,10 @@ public final class Main {
         if (args[0].equals("init")) {
             try (Connection c = DriverManager.getConnection(url, db)) {
                 PgOutboxStore.install(c, table);
+            } catch (PgOutboxStore.TableBusyException e) {
+                System.err.println(e.getMessage());
+                System.exit(1);
+                return;
             }
             System.err.println("outbox table " + table + " ready");
             return;

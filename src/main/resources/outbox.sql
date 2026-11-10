@@ -1,6 +1,14 @@
--- outbox-relay schema. Safe to run again.
+-- outbox-relay schema. Safe to run again, on a busy table too.
 -- The app inserts into the outbox table in the same transaction as its own data; the relay does the rest.
 -- {table} and the other names in braces are filled in from OUTBOX_TABLE (default outbox), already quoted.
+--
+-- A run that finds everything in place takes no lock on the table. That matters because a schema change that has to
+-- wait for a lock makes every later insert wait behind it: with one long transaction open on the table, a plain
+-- "create index if not exists" or "drop trigger if exists" stalls the application until that transaction ends.
+-- When the table does have to change (an upgrade from an older version), the wait is capped: after 3 s the run
+-- gives up and nothing has changed. install() runs this file in one transaction, which "set local" needs.
+
+set local lock_timeout = '3s';
 
 create table if not exists {table} (
     id         bigint generated always as identity primary key,
@@ -31,7 +39,14 @@ end
 $$;
 
 -- The relay reads only unsent rows, in id order: this index stays as small as the backlog.
-create index if not exists {index} on {table} (id) where sent_at is null;
+-- Looked up first: "create index if not exists" locks the table against writes before it checks the name.
+do $$
+begin
+    if to_regclass({index_literal}) is null then
+        create index {index} on {table} (id) where sent_at is null;
+    end if;
+end
+$$;
 
 -- One notification per inserting statement, delivered at commit, wakes the relay at once.
 create or replace function {function}() returns trigger language plpgsql as $$
@@ -41,5 +56,13 @@ begin
 end
 $$;
 
-drop trigger if exists {trigger} on {table};
-create trigger {trigger} after insert on {table} for each statement execute function {function}();
+-- The trigger has had this one form since the first version, so one that exists is left alone: dropping and making
+-- it again would take ACCESS EXCLUSIVE on the table for nothing. What it does lives in the function above.
+do $$
+begin
+    if not exists (select 1 from pg_trigger
+                    where tgrelid = {table_literal}::regclass and tgname = {trigger_literal} and not tgisinternal) then
+        create trigger {trigger} after insert on {table} for each statement execute function {function}();
+    end if;
+end
+$$;
