@@ -49,14 +49,24 @@ public final class Relay {
     /** What one step did. */
     public enum Step { STANDBY, IDLE, PUBLISHED, FULL, RETRY }
 
+    /** How the relay waits. Tests pass their own to see each wait without timing it. */
+    @FunctionalInterface
+    public interface Sleeper {
+        void sleep(Duration wait) throws InterruptedException;
+    }
+
     private final OutboxStore store;
     private final Publisher publisher;
     private final Settings settings;
     private final Clock clock;
+    private final Sleeper sleeper;
     private final Stats stats = new Stats();
 
     private volatile boolean leading;
     private int limit;
+    // Rounds in a row that did not go through. Reset by a clean round: a batch marked sent, an empty outbox
+    // waited on, or a standby round. Not by a fetch alone: while Kafka is down every fetch works and every publish
+    // fails, and the wait must still grow.
     private int failuresInARow;
     private long rejectedRow = -1;
     private int rejections;
@@ -73,10 +83,15 @@ public final class Relay {
     }
 
     public Relay(OutboxStore store, Publisher publisher, Settings settings, Clock clock) {
+        this(store, publisher, settings, clock, Thread::sleep);
+    }
+
+    public Relay(OutboxStore store, Publisher publisher, Settings settings, Clock clock, Sleeper sleeper) {
         this.store = store;
         this.publisher = publisher;
         this.settings = settings;
         this.clock = clock;
+        this.sleeper = sleeper;
         this.limit = settings.batchSize();
     }
 
@@ -97,7 +112,7 @@ public final class Relay {
     public void run() throws InterruptedException {
         while (!stopping) {
             switch (step()) {
-                case STANDBY -> Thread.sleep(settings.standbyWait());
+                case STANDBY -> sleeper.sleep(settings.standbyWait());
                 case IDLE -> idle();
                 case PUBLISHED, FULL, RETRY -> { }
             }
@@ -111,6 +126,7 @@ public final class Relay {
                 leading = store.tryLead();
                 if (!leading) {
                     unmarked = null; // the relay that leads now sends those rows itself (a repeat, never a loss)
+                    failuresInARow = 0; // the database answered: whatever outage there was is over
                     return Step.STANDBY;
                 }
                 limit = settings.batchSize();
@@ -217,6 +233,7 @@ public final class Relay {
     private void idle() throws InterruptedException {
         try {
             store.awaitWork(settings.idleWait());
+            failuresInARow = 0; // a clean round with nothing to send: the next failure starts at minBackoff
         } catch (InterruptedException e) {
             throw e;
         } catch (Exception e) {
@@ -231,6 +248,6 @@ public final class Relay {
         long min = settings.minBackoff().toMillis();
         long wait = Math.min(settings.maxBackoff().toMillis(), min << Math.min(failuresInARow, 20));
         failuresInARow++;
-        Thread.sleep(wait);
+        sleeper.sleep(Duration.ofMillis(wait));
     }
 }

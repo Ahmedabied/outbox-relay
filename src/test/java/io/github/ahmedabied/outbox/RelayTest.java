@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.logging.Handler;
@@ -77,6 +78,63 @@ class RelayTest {
         var e = assertThrows(RelayStoppedException.class, () -> drain(relay));
         assertTrue(e.getMessage().startsWith("row 250 cannot be published"), e.getMessage());
         assertEquals(range(1, 249), ids(kafka.visible));
+    }
+
+    @Test
+    void aBrokerOutageWaitsLongerEachTryAndTheFirstPublishStartsOver() throws Exception {
+        var db = new Fakes.Db().insert(10, 3);
+        var kafka = new Fakes.Kafka();
+        kafka.retriableFailures = 8; // the database answers every fetch; only Kafka is down
+        List<Long> waits = new ArrayList<>();
+        var relay = new Relay(new Fakes.Store(db), kafka, Relay.Settings.defaults(), Clock.systemUTC(),
+                w -> waits.add(w.toMillis()));
+        drain(relay);
+        assertEquals(List.of(100L, 200L, 400L, 800L, 1_600L, 3_200L, 6_400L, 10_000L), waits);
+        db.insert(10, 3);
+        kafka.retriableFailures = 1;
+        drain(relay);
+        assertEquals(100L, waits.get(waits.size() - 1)); // a new outage starts at the shortest wait
+        assertEquals(range(1, 20), ids(kafka.visible));
+    }
+
+    @Test
+    void anOutageThatEndsOnAnEmptyOutboxDoesNotSlowTheNextOne() throws Exception {
+        var store = new Fakes.Store(new Fakes.Db());
+        store.failLeads = 6; // the database is down for six tries, then back, with nothing to send
+        List<Long> waits = new ArrayList<>();
+        var relay = new Relay[1];
+        int[] awaits = {0};
+        store.onAwait = () -> {
+            if (++awaits[0] == 1) {
+                store.failFetches = 1; // later, one unrelated dropped connection
+            } else {
+                relay[0].stop();
+            }
+        };
+        relay[0] = new Relay(store, new Fakes.Kafka(), Relay.Settings.defaults(), Clock.systemUTC(),
+                w -> waits.add(w.toMillis()));
+        relay[0].run();
+        assertEquals(List.of(100L, 200L, 400L, 800L, 1_600L, 3_200L, 100L), waits);
+    }
+
+    @Test
+    void aStandbyThatReachesTheDatabaseAgainStartsItsWaitsOver() throws Exception {
+        var db = new Fakes.Db().insert(10, 3);
+        assertTrue(new Fakes.Store(db).tryLead()); // another relay leads
+        var standby = new Fakes.Store(db);
+        standby.failLeads = 6;
+        List<Long> waits = new ArrayList<>();
+        var relay = new Relay[1];
+        relay[0] = new Relay(standby, new Fakes.Kafka(), Relay.Settings.defaults(), Clock.systemUTC(), w -> {
+            waits.add(w.toMillis());
+            if (waits.size() == 7) {
+                standby.failLeads = 1; // after one quiet standby wait, one more dropped connection
+            } else if (waits.size() == 9) {
+                relay[0].stop();
+            }
+        });
+        relay[0].run();
+        assertEquals(List.of(100L, 200L, 400L, 800L, 1_600L, 3_200L, 1_000L, 100L, 1_000L), waits);
     }
 
     @Test

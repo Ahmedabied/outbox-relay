@@ -51,7 +51,7 @@ names of earlier versions, so an existing install carries on as it is.
 | Order per key | Rows go out in id order, and each batch is **one Kafka transaction** with an idempotent producer (`acks=all`). A failed batch is aborted, so `read_committed` consumers never see half of it and a retry cannot reorder. |
 | One relay at a time | The relay holds a Postgres session advisory lock on its own connection, keyed on the table itself (schema and name), so replicas take turns whatever else differs between them. If that connection dies, the lock goes with it and a standby takes over. The Kafka `transactional.id` is a second fence, when replicas share it (the default): a relay that still thinks it leads is refused by Kafka. |
 | A bad row is not skipped | A row Kafka refuses for good (too large, say) is narrowed down, everything before it goes out, then the relay stops and names the row. Skipping it would deliver later events for the same key without it. |
-| Outages are waited out | Broker or network trouble is retried with backoff, forever, and the database connection is rebuilt. A batch Kafka already has when the database goes is kept in memory and marked first once the database is back, so a lost connection repeats nothing. If marking keeps failing (a permission, say), the relay keeps retrying it and publishes nothing new, rather than sending the same batch again and again. It reads nothing meanwhile, so `last_fetch_timestamp_seconds` goes stale and the OutboxRelayStalled alert fires. |
+| Outages are waited out | Broker or network trouble is retried with backoff, forever, and the database connection is rebuilt. The wait doubles from 100 ms to 10 s while rounds keep failing and drops back to 100 ms after the first clean round (a batch marked sent, an empty outbox, a standby round), so the next outage starts short. A batch Kafka already has when the database goes is kept in memory and marked first once the database is back, so a lost connection repeats nothing. If marking keeps failing (a permission, say), the relay keeps retrying it and publishes nothing new, rather than sending the same batch again and again. It reads nothing meanwhile, so `last_fetch_timestamp_seconds` goes stale and the OutboxRelayStalled alert fires. |
 | Low lag without polling hard | A statement trigger sends `NOTIFY` on insert, delivered at commit; the relay wakes at once and only polls once a second as a safety net. |
 
 The one thing it cannot do is exactly once: if the relay process dies after Kafka commits and before the database
@@ -151,10 +151,10 @@ one window where a repeat can happen, so both the kept batch and the dedupe are 
 ## Tests
 
 ```bash
-mvn -B verify      # 50 tests: unit, then Postgres and Kafka integration tests in containers
+mvn -B verify      # 53 tests: unit, then Postgres and Kafka integration tests in containers
 ```
 
-- **Unit** (23, in-memory Postgres and Kafka stand-ins): order, retries, the bad-row search, a lost connection and a
+- **Unit** (26, in-memory Postgres and Kafka stand-ins): order, retries and their waits, the bad-row search, a lost connection and a
   dead process between Kafka and the database, a mark that keeps failing, trouble before the lead logged once (a
   missing table is said, not retried in silence), leader handover, fencing, the reserved `outbox-id` header, the metrics endpoint over real HTTP,
   table names (what is refused, and that the default keeps the old object names).

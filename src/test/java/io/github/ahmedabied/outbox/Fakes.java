@@ -35,7 +35,9 @@ final class Fakes {
         final Db db;
         int failMarks;
         int failLeads; // tryLead throws, as when the table is missing or the database is down
+        int failFetches; // fetchUnsent throws, as when the connection drops after the lead was taken
         int fetches;
+        Runnable onAwait = () -> { }; // runs each time the relay waits for work on an empty outbox
 
         Store(Db db) {
             this.db = db;
@@ -57,8 +59,12 @@ final class Fakes {
         }
 
         @Override
-        public List<OutboxRow> fetchUnsent(int limit) {
+        public List<OutboxRow> fetchUnsent(int limit) throws SQLException {
             fetches++;
+            if (failFetches > 0) {
+                failFetches--;
+                throw new SQLException("connection lost");
+            }
             synchronized (db) {
                 List<OutboxRow> out = new ArrayList<>();
                 for (OutboxRow r : db.rows.values()) {
@@ -91,6 +97,7 @@ final class Fakes {
 
         @Override
         public void awaitWork(Duration timeout) {
+            onAwait.run();
         }
 
         @Override
