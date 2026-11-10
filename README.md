@@ -42,7 +42,7 @@ names of earlier versions, so an existing install carries on as it is.
 | Order per key | Rows go out in id order, and each batch is **one Kafka transaction** with an idempotent producer (`acks=all`). A failed batch is aborted, so `read_committed` consumers never see half of it and a retry cannot reorder. |
 | One relay at a time | The relay holds a Postgres session advisory lock on its own connection, keyed on the table itself (schema and name), so replicas take turns whatever else differs between them. If that connection dies, the lock goes with it and a standby takes over. The Kafka `transactional.id` is a second fence, when replicas share it (the default): a relay that still thinks it leads is refused by Kafka. |
 | A bad row is not skipped | A row Kafka refuses for good (too large, say) is narrowed down, everything before it goes out, then the relay stops and names the row. Skipping it would deliver later events for the same key without it. |
-| Outages are waited out | Broker or network trouble is retried with backoff, forever, and the database connection is rebuilt. A batch Kafka already has when the database goes is kept in memory and marked first once the database is back, so a lost connection repeats nothing. If marking keeps failing (a permission, say), the relay keeps retrying it and publishes nothing new, rather than sending the same batch again and again; `oldest_unsent_age_seconds` grows, so the OutboxStuck alert fires. |
+| Outages are waited out | Broker or network trouble is retried with backoff, forever, and the database connection is rebuilt. A batch Kafka already has when the database goes is kept in memory and marked first once the database is back, so a lost connection repeats nothing. If marking keeps failing (a permission, say), the relay keeps retrying it and publishes nothing new, rather than sending the same batch again and again. It reads nothing meanwhile, so `last_fetch_timestamp_seconds` goes stale and the OutboxRelayStalled alert fires. |
 | Low lag without polling hard | A statement trigger sends `NOTIFY` on insert, delivered at commit; the relay wakes at once and only polls once a second as a safety net. |
 
 The one thing it cannot do is exactly once: if the relay process dies after Kafka commits and before the database
@@ -88,22 +88,31 @@ python examples/python-consumer/demo.py --db postgresql://app@localhost/app --ka
 
 Set `OUTBOX_METRICS_ADDR=9464` and the relay serves Prometheus metrics at `http://127.0.0.1:9464/metrics` (a bare
 port binds to localhost; give `0.0.0.0:9464` to expose it). Off when unset. The endpoint reads the relay's own
-counters, never the database, and answers only `GET /metrics`.
+counters, never th`outbox_relay_published_total`, `batches_total`, `retries_total`, `rejections_total`, `database_errors_total`,
+`leading` (1 on the relay that publishes), `lag_seconds{quantile="0.5"|"0.99"}` (insert to Kafka commit),
+`oldest_unsent_age_seconds` (age of the first unsent row at the relay's last read of the outbox) and
+`last_fetch_timestamp_seconds` (when that read was).
 
-`outbox_relay_published_total`, `batches_total`, `retries_total`, `rejections_total`, `database_errors_total`,
-`leading` (1 on the relay that publishes), `lag_seconds{quantile="0.5"|"0.99"}` (insert to Kafka commit), and the
-one to page on:
+Alert rules to start from: [`examples/prometheus/alerts.yml`](examples/prometheus/alerts.yml). CI runs their unit
+tests (`promtool test rules alerts.test.yml`, one case per failure below), and a Java test checks that every metric
+name in the rules is one the relay serves.
 
-```yaml
-- alert: OutboxStuck
-  expr: max(outbox_relay_oldest_unsent_age_seconds) > 60 or absent(outbox_relay_leading == 1)
-  for: 2m
-  annotations:
-    summary: "Events are waiting in the outbox (broker down, a refused row, or no relay leading)"
-```
+| Alert | Fires when | |
+|---|---|---|
+| OutboxStuck | the first unsent row was over 60 s old at the last read, for 2 min | page |
+| OutboxRelayStalled | no relay has read the outbox for over 60 s, for 2 min | page |
+| OutboxNoLeader | no relay leads, for 2 min | page |
+| OutboxRowRefused | Kafka refused a batch in the last 15 min | ticket |
+| OutboxDatabaseErrors | the database connection keeps dropping, for 10 min | ticket |
+| OutboxLagHigh | p99 insert to Kafka commit is over 5 s, for 10 min | ticket |
 
-`oldest_unsent_age_seconds` is the age of the first unsent row at the relay's last read, recorded in its own loop,
-so it keeps growing while Kafka is down and the relay retries.
+The first two cover each other. While Kafka is down the relay retries and reads again each time, so the age grows
+and OutboxStuck fires. While marking a sent batch keeps failing, the relay retries the mark and reads nothing new,
+so the age stands still at its last value and only the stale read time shows it (both cases are tests in
+`MetricsServerTest`). A row Kafka refuses for good stops the relay in about a second, with exit code 1 and the row
+named in its log; every replica stops on the same row, so that pages as OutboxNoLeader.
+
+g while Kafka is down and the relay retries.
 
 ## Measured
 

@@ -1,0 +1,113 @@
+# promtool test rules alerts.test.yml   (test time starts at 0, so last_fetch values are seconds since then)
+rule_files:
+  - alerts.yml
+evaluation_interval: 1m
+
+tests:
+  # Healthy: leading, reading every minute, nothing waiting, low lag. Nothing fires.
+  - interval: 1m
+    input_series:
+      - series: 'outbox_relay_leading'
+        values: '1x30'
+      - series: 'outbox_relay_last_fetch_timestamp_seconds'
+        values: '0+60x30'
+      - series: 'outbox_relay_oldest_unsent_age_seconds'
+        values: '0x30'
+      - series: 'outbox_relay_rejections_total'
+        values: '0x30'
+      - series: 'outbox_relay_database_errors_total'
+        values: '0x30'
+      - series: 'outbox_relay_lag_seconds{quantile="0.99"}'
+        values: '0.05x30'
+    alert_rule_test:
+      - {eval_time: 30m, alertname: OutboxStuck, exp_alerts: []}
+      - {eval_time: 30m, alertname: OutboxRelayStalled, exp_alerts: []}
+      - {eval_time: 30m, alertname: OutboxNoLeader, exp_alerts: []}
+      - {eval_time: 30m, alertname: OutboxRowRefused, exp_alerts: []}
+      - {eval_time: 30m, alertname: OutboxDatabaseErrors, exp_alerts: []}
+      - {eval_time: 30m, alertname: OutboxLagHigh, exp_alerts: []}
+
+  # Kafka down from the start: the relay retries and reads again each time, so the age grows; it is not stalled.
+  - interval: 1m
+    input_series:
+      - series: 'outbox_relay_leading'
+        values: '1x30'
+      - series: 'outbox_relay_last_fetch_timestamp_seconds'
+        values: '0+60x30'
+      - series: 'outbox_relay_oldest_unsent_age_seconds'
+        values: '0+60x30'
+    alert_rule_test:
+      - {eval_time: 3m, alertname: OutboxStuck, exp_alerts: []}
+      - eval_time: 10m
+        alertname: OutboxStuck
+        exp_alerts:
+          - exp_labels: {severity: page}
+            exp_annotations: {summary: "The oldest unsent event is 10m 0s old"}
+      - {eval_time: 10m, alertname: OutboxRelayStalled, exp_alerts: []}
+
+  # Marking fails from minute 5: no new reads, so the age stands still at 3 s and only the stale read shows it.
+  - interval: 1m
+    input_series:
+      - series: 'outbox_relay_leading'
+        values: '1x30'
+      - series: 'outbox_relay_last_fetch_timestamp_seconds'
+        values: '0+60x5 300x25'
+      - series: 'outbox_relay_oldest_unsent_age_seconds'
+        values: '3x30'
+    alert_rule_test:
+      - {eval_time: 7m, alertname: OutboxRelayStalled, exp_alerts: []}
+      - eval_time: 15m
+        alertname: OutboxRelayStalled
+        exp_alerts:
+          - exp_labels: {severity: page}
+            exp_annotations: {summary: "No relay has read the outbox for 10m 0s"}
+      - {eval_time: 15m, alertname: OutboxStuck, exp_alerts: []}
+
+  # The leader loses the database at minute 5 and no relay takes over; later every relay is gone.
+  - interval: 1m
+    input_series:
+      - series: 'outbox_relay_leading{instance="relay-a"}'
+        values: '1x5 0x10'
+      - series: 'outbox_relay_leading{instance="relay-b"}'
+        values: '0x15'
+    alert_rule_test:
+      - {eval_time: 6m, alertname: OutboxNoLeader, exp_alerts: []}
+      - eval_time: 10m
+        alertname: OutboxNoLeader
+        exp_alerts:
+          - exp_labels: {severity: page}
+            exp_annotations: {summary: "No outbox relay is leading"}
+      - eval_time: 30m  # no series at all
+        alertname: OutboxNoLeader
+        exp_alerts:
+          - exp_labels: {severity: page}
+            exp_annotations: {summary: "No outbox relay is leading"}
+
+  # A refused row at minute 5; database errors every minute; lag p99 at 8 s from minute 5.
+  - interval: 1m
+    input_series:
+      - series: 'outbox_relay_rejections_total'
+        values: '0x5 1x25'
+      - series: 'outbox_relay_database_errors_total'
+        values: '0+1x30'
+      - series: 'outbox_relay_lag_seconds{quantile="0.99"}'
+        values: '0.05x5 8x25'
+    alert_rule_test:
+      - {eval_time: 4m, alertname: OutboxRowRefused, exp_alerts: []}
+      - eval_time: 10m
+        alertname: OutboxRowRefused
+        exp_alerts:
+          - exp_labels: {severity: ticket}
+            exp_annotations: {summary: "Kafka refused a batch in the last 15 minutes; the relay log names the row"}
+      - {eval_time: 8m, alertname: OutboxDatabaseErrors, exp_alerts: []}
+      - eval_time: 20m
+        alertname: OutboxDatabaseErrors
+        exp_alerts:
+          - exp_labels: {severity: ticket}
+            exp_annotations: {summary: "The relay has been losing its database connection for 10 minutes"}
+      - {eval_time: 12m, alertname: OutboxLagHigh, exp_alerts: []}
+      - eval_time: 20m
+        alertname: OutboxLagHigh
+        exp_alerts:
+          - exp_labels: {severity: ticket}
+            exp_annotations: {summary: "p99 insert to Kafka commit is 8s"}

@@ -1,0 +1,62 @@
+# Alert rules for the relay's /metrics (OUTBOX_METRICS_ADDR). Tested with `promtool test rules alerts.test.yml`;
+# MetricsServerTest checks that every metric name used here is one the relay serves. Thresholds are starting
+# points. A healthy or retrying leader reads the outbox at least every 10 s (the longest backoff by default).
+groups:
+  - name: outbox-relay
+    rules:
+      - alert: OutboxStuck
+        # The first unsent row was over a minute old at the leader's last read. Fires while Kafka is down: each
+        # retry reads again, so the age keeps growing.
+        expr: max(outbox_relay_oldest_unsent_age_seconds) > 60
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "The oldest unsent event is {{ $value | humanizeDuration }} old"
+
+      - alert: OutboxRelayStalled
+        # No relay has read the outbox for over a minute. This catches what the age cannot: while marking keeps
+        # failing the relay retries the mark and reads nothing, so the age stands still; and a hung relay.
+        expr: time() - max(outbox_relay_last_fetch_timestamp_seconds) > 60
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "No relay has read the outbox for {{ $value | humanizeDuration }}"
+
+      - alert: OutboxNoLeader
+        # No relay holds the lead: all are down, none can reach the database, or each one stopped on a row Kafka
+        # refuses for good (it exits with code 1 and its log names the row).
+        expr: absent(outbox_relay_leading == 1)
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "No outbox relay is leading"
+
+      - alert: OutboxRowRefused
+        # Kafka refused a batch and the relay narrowed it down. A row refused for good stops the relay in about a
+        # second, which a scrape rarely catches; that case shows as OutboxNoLeader.
+        expr: increase(outbox_relay_rejections_total[15m]) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Kafka refused a batch in the last 15 minutes; the relay log names the row"
+
+      - alert: OutboxDatabaseErrors
+        # The relay keeps losing its database connection (each error drops and rebuilds it).
+        expr: rate(outbox_relay_database_errors_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "The relay has been losing its database connection for 10 minutes"
+
+      - alert: OutboxLagHigh
+        # p99 from insert to Kafka commit, over the relay's last 65,536 rows.
+        expr: max(outbox_relay_lag_seconds{quantile="0.99"}) > 5
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "p99 insert to Kafka commit is {{ $value | humanizeDuration }}"
